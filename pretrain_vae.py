@@ -176,14 +176,27 @@ if __name__ == "__main__":
 
         # Print logs
         if update % args.log_interval == 0:
-            header = ["batch_elbo_loss"]
-            data = [logs["batch_elbo_loss"]]
-            txt_logger.info("elbo_loss {:.3f}".format(*data))
+            header = ["batch_elbo_loss", "batch_recon_nll", "batch_kl", "grad_norm", "total_valid_steps"]
+            data = [
+                logs.get("batch_elbo_loss", 0.0),
+                logs.get("batch_recon_nll", 0.0),
+                logs.get("batch_kl", 0.0),
+                logs.get("grad_norm", 0.0),
+                logs.get("total_valid_steps", 0),
+            ]
+            txt_logger.info(
+                f"ELBO {data[0]:.3f} | ReconNLL {data[1]:.3f} | KL {data[2]:.3f} | "
+                f"Grad {data[3]:.3f} | Valid steps {data[4]}"
+            )
 
             if status["epochs"] == 0:
                 csv_logger.writerow(header)
             csv_logger.writerow(data)
             csv_file.flush()
+            tb_writer.add_scalar("train/elbo_loss", data[0], update)
+            tb_writer.add_scalar("train/recon_nll", data[1], update)
+            tb_writer.add_scalar("train/kl", data[2], update)
+            tb_writer.add_scalar("train/grad_norm", data[3], update)
 
         print(epochs, "epochs")
         epochs += 1

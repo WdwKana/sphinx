@@ -94,6 +94,8 @@ class Algo():
 
         history_encodings = []
         batch_elbo_loss = 0
+        batch_kl = 0
+        batch_recon_nll = 0
         max_steps, num_episodes = exps.mask.shape[0], exps.mask.shape[1]
 
         # Initialize memory
@@ -128,8 +130,18 @@ class Algo():
                 encoder_mean, encoder_std = self.belief_vae.encoder_dist(state_features, history_encoding)
                 zs = encoder_mean + torch.randn_like(encoder_mean) * encoder_std
                 decoder_mean, decoder_std = self.belief_vae.decoder_dist(zs, history_encoding)
-                elbo = prior_dist.log_prob(zs).sum(dim=-1) + Normal(decoder_mean, decoder_std).log_prob(state_features).sum(dim=-1) - Normal(encoder_mean, encoder_std).log_prob(zs).sum(dim=-1)
-                batch_elbo_loss += -(elbo * sb.mask.to(device)).sum() #* torch.pow(torch.tensor(0.95).to(device), step) #
+                log_pz = prior_dist.log_prob(zs).sum(dim=-1)
+                log_px_z = Normal(decoder_mean, decoder_std).log_prob(state_features).sum(dim=-1)
+                log_qz_x = Normal(encoder_mean, encoder_std).log_prob(zs).sum(dim=-1)
+
+                elbo = log_pz + log_px_z - log_qz_x
+                kl_term = (log_qz_x - log_pz)          # KL(q||p)
+                recon_term = (-log_px_z)               # negative log-likelihood
+
+                mask = sb.mask.to(device)
+                batch_elbo_loss += -(elbo * mask).sum() #* torch.pow(torch.tensor(0.95).to(device), step) #
+                batch_kl        += (kl_term * mask).sum()
+                batch_recon_nll += (recon_term * mask).sum()
 
                 # Logging
                 if "Genie" in self.env.__class__.__name__:
@@ -147,7 +159,11 @@ class Algo():
             else:
                 break
 
-        batch_elbo_loss /= exps.mask.sum()
+        total_valid_steps = exps.mask.sum()
+        if total_valid_steps > 0:
+            batch_elbo_loss /= total_valid_steps
+            batch_kl        /= total_valid_steps
+            batch_recon_nll /= total_valid_steps
 
         self.vae_optimizer.zero_grad()
         batch_elbo_loss.backward()
@@ -158,5 +174,11 @@ class Algo():
 
         self.vae_optimizer.step()
 
-        logs = {"batch_elbo_loss": batch_elbo_loss}
+        logs = {
+            "batch_elbo_loss": batch_elbo_loss.item(),
+            "batch_kl": batch_kl.item() if total_valid_steps > 0 else 0.0,
+            "batch_recon_nll": batch_recon_nll.item() if total_valid_steps > 0 else 0.0,
+            "grad_norm": grad_norm,
+            "total_valid_steps": total_valid_steps.item(),
+        }
         return logs

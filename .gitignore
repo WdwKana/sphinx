@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pt
+slurm_logs/
+storage/
+data/
