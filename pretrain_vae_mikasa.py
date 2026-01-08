@@ -42,6 +42,12 @@ if __name__ == "__main__":
     parser.add_argument("--save-dir", default="storage",
                         help="Directory to save models")
     parser.add_argument(
+        "--num-episodes",
+        type=int,
+        default=None,
+        help="If set, randomly sample this many episodes (uniform, uses --seed); episode internal order is preserved.",
+    )
+    parser.add_argument(
         "--rep-model-path",
         default=None,
         help=(
@@ -121,6 +127,24 @@ if __name__ == "__main__":
     # Load Data
     txt_logger.info(f"Loading data from {args.data_path}...")
     data = torch.load(args.data_path)
+
+    # Episode subsetting: random uniform subset; keeps per-episode time order intact.
+    if args.num_episodes is not None:
+        total_eps = int(data["masks"].shape[0])
+        k = int(args.num_episodes)
+        if k <= 0:
+            raise ValueError("--num-episodes must be > 0")
+        k = min(k, total_eps)
+        g = torch.Generator()
+        g.manual_seed(args.seed)
+        ep_ids = torch.randperm(total_eps, generator=g)[:k]
+        ep_ids, _ = torch.sort(ep_ids)
+
+        def _slice_episode_dim(tensor):
+            return tensor[ep_ids] if torch.is_tensor(tensor) and tensor.shape[0] == total_eps else tensor
+
+        data = {k_: _slice_episode_dim(v_) for k_, v_ in data.items()}
+        txt_logger.info(f"[data] using episodes: {len(ep_ids)}/{total_eps} (seeded random subset)")
     
     # Raw data shapes: (N_episodes, T, ...)
     obss = data["obss"]

@@ -58,6 +58,12 @@ if __name__ == "__main__":
                         help="Path of collected data (.pt file)")
     parser.add_argument("--save-dir", default="storage",
                         help="Directory to save models (default: storage)")
+    parser.add_argument(
+        "--num-episodes",
+        type=int,
+        default=None,
+        help="If set, randomly sample this many episodes (uniform, uses --seed); episode internal order is preserved.",
+    )
 
     ## Parameters for main algorithm
     parser.add_argument("--optim-eps", type=float, default=1e-8,
@@ -135,6 +141,25 @@ if __name__ == "__main__":
     # Load data
     print(f"Loading data from {args.data_path}...")
     data = torch.load(args.data_path)
+
+    # Episode subsetting (robot RL style): random uniform subset of episodes, reproducible via --seed.
+    # Keeps per-episode time order intact; only reduces how many episodes are used.
+    if args.num_episodes is not None:
+        total_eps = int(data["masks"].shape[0])
+        k = int(args.num_episodes)
+        if k <= 0:
+            raise ValueError("--num-episodes must be > 0")
+        k = min(k, total_eps)
+        g = torch.Generator()
+        g.manual_seed(args.seed)
+        ep_ids = torch.randperm(total_eps, generator=g)[:k]
+        ep_ids, _ = torch.sort(ep_ids)  # keep natural episode order after random pick
+
+        def _slice_episode_dim(tensor):
+            return tensor[ep_ids] if torch.is_tensor(tensor) and tensor.shape[0] == total_eps else tensor
+
+        data = {k_: _slice_episode_dim(v_) for k_, v_ in data.items()}
+        print(f"[data] using episodes: {len(ep_ids)}/{total_eps} (seeded random subset)")
 
     # Extract dimensions from data
     obss = data["obss"]      # (N, T, H, W, C) uint8

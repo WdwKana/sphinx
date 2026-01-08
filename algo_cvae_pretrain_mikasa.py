@@ -71,6 +71,9 @@ class Algo():
         
         history_encodings = []
         batch_elbo_loss = 0
+        batch_kl = 0
+        batch_recon_nll = 0
+        batch_action_fm = 0
         
         # exps.mask shape: (T, B)
         max_steps, num_episodes = exps.mask.shape[0], exps.mask.shape[1]
@@ -150,7 +153,15 @@ class Algo():
                 
                 # Accumulate Loss (Masked)
                 # Note: Original code sums negative ELBO
-                batch_elbo_loss += -(elbo * sb.mask.to(self.device)).sum()
+                mask = sb.mask.to(self.device)
+                recon_term = -log_px_z
+                kl_term = kl
+                action_term_to_log = action_term if torch.is_tensor(action_term) else torch.zeros_like(log_px_z)
+
+                batch_elbo_loss += -(elbo * mask).sum()
+                batch_kl        += (kl_term * mask).sum().detach()
+                batch_recon_nll += (recon_term * mask).sum().detach()
+                batch_action_fm += (action_term_to_log * mask).sum().detach()
 
             else:
                 # All episodes done
@@ -160,6 +171,9 @@ class Algo():
         total_valid_steps = exps.mask.sum()
         if total_valid_steps > 0:
             batch_elbo_loss /= total_valid_steps
+            batch_kl        /= total_valid_steps
+            batch_recon_nll /= total_valid_steps
+            batch_action_fm /= total_valid_steps
 
         # Optimization Step
         self.vae_optimizer.zero_grad()
@@ -171,5 +185,12 @@ class Algo():
         
         self.vae_optimizer.step()
 
-        logs = {"batch_elbo_loss": batch_elbo_loss.item(), "grad_norm": grad_norm}
+        logs = {
+            "batch_elbo_loss": batch_elbo_loss.item(),
+            "batch_kl": batch_kl.item() if total_valid_steps > 0 else 0.0,
+            "batch_recon_nll": batch_recon_nll.item() if total_valid_steps > 0 else 0.0,
+            "batch_action_fm": batch_action_fm.item() if total_valid_steps > 0 else 0.0,
+            "grad_norm": grad_norm,
+            "total_valid_steps": total_valid_steps.item(),
+        }
         return logs

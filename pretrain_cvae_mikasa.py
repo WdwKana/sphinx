@@ -42,6 +42,12 @@ if __name__ == "__main__":
     parser.add_argument("--save-dir", default="storage",
                         help="Directory to save models")
     parser.add_argument(
+        "--num-episodes",
+        type=int,
+        default=None,
+        help="If set, randomly sample this many episodes (uniform, uses --seed); episode internal order is preserved.",
+    )
+    parser.add_argument(
         "--rep-model-path",
         default=None,
         help=(
@@ -128,6 +134,24 @@ if __name__ == "__main__":
     # Load Data
     txt_logger.info(f"Loading data from {args.data_path}...")
     data = torch.load(args.data_path)
+
+    # Episode subsetting: random uniform subset; keeps per-episode time order intact.
+    if args.num_episodes is not None:
+        total_eps = int(data["masks"].shape[0])
+        k = int(args.num_episodes)
+        if k <= 0:
+            raise ValueError("--num-episodes must be > 0")
+        k = min(k, total_eps)
+        g = torch.Generator()
+        g.manual_seed(args.seed)
+        ep_ids = torch.randperm(total_eps, generator=g)[:k]
+        ep_ids, _ = torch.sort(ep_ids)
+
+        def _slice_episode_dim(tensor):
+            return tensor[ep_ids] if torch.is_tensor(tensor) and tensor.shape[0] == total_eps else tensor
+
+        data = {k_: _slice_episode_dim(v_) for k_, v_ in data.items()}
+        txt_logger.info(f"[data] using episodes: {len(ep_ids)}/{total_eps} (seeded random subset)")
     
     # Raw data shapes: (N_episodes, T, ...)
     obss = data["obss"]
@@ -287,9 +311,27 @@ if __name__ == "__main__":
         epochs += 1
 
         if update % args.log_interval == 0:
-            header = ["batch_elbo_loss", "grad_norm"]
-            data = [logs["batch_elbo_loss"], logs["grad_norm"]]
-            txt_logger.info(f"Epoch {epoch_idx} | Update {update} | Loss: {data[0]:.4f} | Grad: {data[1]:.4f}")
+            header = [
+                "batch_elbo_loss",
+                "batch_recon_nll",
+                "batch_kl",
+                "batch_action_fm",
+                "grad_norm",
+                "total_valid_steps",
+            ]
+            data = [
+                logs.get("batch_elbo_loss", 0.0),
+                logs.get("batch_recon_nll", 0.0),
+                logs.get("batch_kl", 0.0),
+                logs.get("batch_action_fm", 0.0),
+                logs.get("grad_norm", 0.0),
+                logs.get("total_valid_steps", 0),
+            ]
+            txt_logger.info(
+                f"Epoch {epoch_idx} | Update {update} | "
+                f"ELBO: {data[0]:.4f} | ReconNLL: {data[1]:.4f} | KL: {data[2]:.4f} | "
+                f"ActionFM: {data[3]:.4f} | Grad: {data[4]:.4f} | Valid steps: {data[5]}"
+            )
 
             if status.get("epochs", 0) == 0 and update == 1:
                 csv_logger.writerow(header)
@@ -297,7 +339,10 @@ if __name__ == "__main__":
             csv_file.flush()
 
             tb_writer.add_scalar("train/elbo_loss", data[0], update)
-            tb_writer.add_scalar("train/grad_norm", data[1], update)
+            tb_writer.add_scalar("train/recon_nll", data[1], update)
+            tb_writer.add_scalar("train/kl", data[2], update)
+            tb_writer.add_scalar("train/action_fm", data[3], update)
+            tb_writer.add_scalar("train/grad_norm", data[4], update)
 
         # Save status (based on update count, consistent with CLI help text)
         if args.save_interval > 0 and update % args.save_interval == 0:
