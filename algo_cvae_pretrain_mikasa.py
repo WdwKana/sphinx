@@ -144,7 +144,24 @@ class Algo():
                     t_noise = torch.rand(action.shape[0], 1, device=self.device)
                     xt = t_noise * action + (1 - t_noise) * eps
                     v_target = action - eps  # flow matching target
+                    
+                    # =====================================================================
+                    # [实验 2: Probe(z-only)] 验证 z 是否天然包含动作信息
+                    # - 屏蔽 h (用全零替代)，强迫 action head 只能依赖 z
+                    # - detach z，阻止 action 梯度回传到 belief_vae
+                    # 如果 ActionFM 还能下降，说明 z 确实携带动作信息 (Idea 成立!)
+                    # 如果 ActionFM 降不下去，说明动作信息主要不在 z
+                    # =====================================================================
+                    # >>> 实验开关：取消下面 3 行注释启用 Probe(z-only)，并注释掉原版 <<<
+                    #h_for_action = torch.zeros_like(history_encoding)  # 屏蔽 h，防止作弊
+                    #z_for_action = zs.detach()                         # 阻断梯度回传
+                    #act_in = torch.cat([xt, t_noise, h_for_action, z_for_action], dim=1)
+                    
+                    # =====================================================================
+                    # [原版代码备份] 恢复时：注释掉上面 3 行，取消下面 1 行注释
+                    # =====================================================================
                     act_in = torch.cat([xt, t_noise, history_encoding, zs], dim=1)
+                    
                     v_hat = self.action_flow_head(act_in)
                     action_term = F.mse_loss(v_hat, v_target, reduction="none").sum(dim=-1)
                 

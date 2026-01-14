@@ -55,17 +55,24 @@ class Algo():
             batch_obs_dynamics_loss = 0
             batch_reward_loss = 0
             batch_kl_loss = 0
-
-            # Changed: Create sub-batch using dict access instead of DictList slicing
-            # MEMORY OPTIMIZATION: Convert obs from uint8 to float only when batching
             sb = {}
+            '''
             for key, val in self.exps.items():
                 batch_val = val[inds]
                 # obs and next_obs are stored as uint8, convert to float here
                 if key in ('obs', 'next_obs'):
                     batch_val = batch_val.float()  # uint8 -> float32
                 sb[key] = batch_val.to(self.device)
-
+            '''
+            # Changed: Create sub-batch using dict access instead of DictList slicing
+            for key, val in self.exps.items():
+                batch_val = val[inds]
+                # Keep obs/next_obs as uint8; encode_obs handles float/normalize on GPU.
+                if key in ('obs', 'next_obs'):
+                    sb[key] = batch_val.to(self.device, non_blocking=True)
+                else:
+                    sb[key] = batch_val.to(self.device)
+            
             # Changed: Pass tensors directly instead of DictList objects
             # Original: self.rep_model.encode_state(sb.state) where sb.state.image was accessed inside
             # Now: self.rep_model.encode_state(sb['state']) where sb['state'] is the tensor directly

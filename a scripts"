@@ -1,0 +1,1314 @@
+[1mdiff --git a/.gitignore b/.gitignore[m
+[1mnew file mode 100644[m
+[1mindex 0000000..017d7fc[m
+[1m--- /dev/null[m
+[1m+++ b/.gitignore[m
+[36m@@ -0,0 +1,7 @@[m
+[32m+[m[32m__pycache__/[m
+[32m+[m[32m*.pyc[m
+[32m+[m[32m*.pyo[m
+[32m+[m[32m*.pt[m
+[32m+[m[32mslurm_logs/[m
+[32m+[m[32mstorage/[m
+[32m+[m[32mdata/[m
+[1mdiff --git a/algo_cvae_pretrain_mikasa.py b/algo_cvae_pretrain_mikasa.py[m
+[1mnew file mode 100644[m
+[1mindex 0000000..c10a490[m
+[1m--- /dev/null[m
+[1m+++ b/algo_cvae_pretrain_mikasa.py[m
+[36m@@ -0,0 +1,175 @@[m
+[32m+[m[32mimport torch[m
+[32m+[m[32mimport torch.nn as nn[m
+[32m+[m[32mimport torch.nn.functional as F[m
+[32m+[m[32mimport numpy[m
+[32m+[m[32mfrom torch.distributions.normal import Normal[m
+[32m+[m[32mimport torch.distributions.kl as KL[m
+[32m+[m[32mfrom torch_ac.utils import DictList[m
+[32m+[m[32mfrom rl_utils import device[m
+[32m+[m
+[32m+[m[32mclass Algo():[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Mikasa-specific VAE Pretraining Algo.[m
+[32m+[m[32m    Adapted from algo_vae_pretrain.py with minimal changes to logic flow.[m
+[32m+[m[32m    """[m
+[32m+[m
+[32m+[m[32m    def __init__(self, env, device=None, adam_eps=1e-8, preprocess_obss=None, lr_g=0.0003, epochs_g=16, rep_model=None,[m
+[32m+[m[32m                 latent_dim=8, latent_dim_f=16, beta=0.0001, gradient_threshold=200, tb_writer=None, use_cnn=False):[m
+[32m+[m
+[32m+[m[32m        self.env = env[m
+[32m+[m[32m        self.device = device[m
+[32m+[m[32m        self.epochs_g = epochs_g[m
+[32m+[m[32m        self.latent_dim = latent_dim[m
+[32m+[m[32m        self.gradient_threshold = gradient_threshold[m
+[32m+[m[32m        self.rep_model = rep_model[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Mikasa VAE model passed as belief_vae? Or initialized here?[m
+[32m+[m[32m        # In pretrain_vae_mikasa.py we pass env, rep_model etc.[m
+[32m+[m[32m        # But we need to use the passed belief_vae if possible, or init it.[m
+[32m+[m[32m        # Original code inits belief_vae inside __init__.[m
+[32m+[m[32m        # But for Mikasa we might want to pass it or init it with specific params.[m
+[32m+[m[32m        # Let's assume pretrain_vae_mikasa.py passes the model via a hack or we adapt __init__ signature.[m
+[32m+[m[32m        # WAIT: pretrain_vae_mikasa.py calls Algo(env, device, ...). It DOES NOT pass belief_vae instance directly in original code style.[m
+[32m+[m[32m        # BUT I modified pretrain_vae_mikasa.py to pass specific args.[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Let's check how I modified pretrain_vae_mikasa.py:[m
+[32m+[m[32m        # algo = algo_vae_pretrain.Algo([m
+[32m+[m[32m        #    belief_vae=vae_model, ...[m
+[32m+[m[32m        # )[m
+[32m+[m[32m        # So I changed the signature in my previous response.[m
+[32m+[m[32m        # Let's update this file's __init__ to accept belief_vae directly to be cleaner.[m
+[32m+[m[32m        pass[m
+[32m+[m
+[32m+[m[32m    # Re-defining __init__ to match the usage in pretrain_vae_mikasa.py[m
+[32m+[m[32m    def __init__(self, belief_vae, rep_model=None, device=None, lr_g=0.0003, adam_eps=1e-8, batch_size_g=128, history_recurrence=16, beta=0.0001, action_dim=None, lambda_action=1.0):[m
+[32m+[m[32m        self.belief_vae = belief_vae[m
+[32m+[m[32m        self.device = device[m
+[32m+[m[32m        self.batch_size_g = batch_size_g[m
+[32m+[m[32m        self.history_recurrence = history_recurrence[m
+[32m+[m[32m        self.beta = beta[m
+[32m+[m[32m        self.rep_model = rep_model[m
+[32m+[m[32m        self.epochs_g = 1 # Added to match loop usage if needed, or controlled outside[m
+[32m+[m[32m        self.lambda_action = lambda_action[m
+[32m+[m[32m        self.action_dim = action_dim[m
+[32m+[m[32m        # Flow-matching style action head: predicts velocity v given xt, t, h, z[m
+[32m+[m[32m        # Input dim: action_dim + 1 (t) + context_dim + latent_dim[m
+[32m+[m[32m        if action_dim is not None:[m
+[32m+[m[32m            self.action_flow_head = nn.Sequential([m
+[32m+[m[32m                nn.Linear(action_dim + 1 + self.belief_vae.context_dim + self.belief_vae.latent_dim, 256),[m
+[32m+[m[32m                nn.ReLU(),[m
+[32m+[m[32m                nn.Linear(256, action_dim),[m
+[32m+[m[32m            ).to(self.device)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            self.action_flow_head = None[m
+[32m+[m[32m        self.vae_optimizer = torch.optim.Adam(self.belief_vae.parameters(), lr_g, eps=adam_eps)[m
+[32m+[m[32m        if self.action_flow_head is not None:[m
+[32m+[m[32m            self.vae_optimizer.add_param_group({"params": self.action_flow_head.parameters()})[m
+[32m+[m
+[32m+[m[32m    def update_g_parameters(self, exps):[m
+[32m+[m[32m        # exps: DictList with obs, state, mask.[m
+[32m+[m[32m        # Dimensions: (T, B, ...)[m
+[32m+[m[41m        [m
+[32m+[m[32m        history_encodings = [][m
+[32m+[m[32m        batch_elbo_loss = 0[m
+[32m+[m[41m        [m
+[32m+[m[32m        # exps.mask shape: (T, B)[m
+[32m+[m[32m        max_steps, num_episodes = exps.mask.shape[0], exps.mask.shape[1][m
+[32m+[m
+[32m+[m[32m        # Initialize memory[m
+[32m+[m[32m        # Mikasa VAE memory size[m
+[32m+[m[32m        memory = torch.zeros((num_episodes, self.belief_vae.history_model.memory_size)).to(self.device)[m
+[32m+[m
+[32m+[m[32m        # Main Loop over time[m
+[32m+[m[32m        for step in range(max_steps):[m
+[32m+[m[32m            sb = exps[step] # Sub-batch at time step[m
+[32m+[m
+[32m+[m[32m            # Check if any episode is active[m
+[32m+[m[32m            if sb.mask.sum() > 0:[m
+[32m+[m[32m                with torch.no_grad():[m
+[32m+[m[32m                    # Get State Features (Ground Truth State)[m
+[32m+[m[32m                    # Mikasa state is already a vector, just flatten if needed[m
+[32m+[m[32m                    if self.rep_model is not None:[m
+[32m+[m[32m                        rep_encoder_mean, rep_encoder_std = self.rep_model.encode_state(sb.state)[m
+[32m+[m[32m                        state_features = rep_encoder_mean[m
+[32m+[m[32m                    else:[m
+[32m+[m[32m                        state_features = sb.state.to(self.device).flatten(start_dim=1)[m
+[32m+[m
+[32m+[m[32m                # 1. Forward History / Update Memory[m
+[32m+[m[32m                # Note: Original code detaches memory every 16 steps?[m
+[32m+[m[32m                # "if step % 16 == 0: ... memory.detach() ..."[m
+[32m+[m[32m                # This implements truncated BPTT.[m
+[32m+[m[41m                [m
+[32m+[m[32m                obs_t = sb.obs.to(self.device)[m
+[32m+[m[32m                mask_t = sb.mask.to(self.device).unsqueeze(dim=1)[m
+[32m+[m[41m                [m
+[32m+[m[32m                if step % 16 == 0:[m
+[32m+[m[32m                    history_encoding, memory = self.belief_vae(obs_t, memory.detach() * mask_t)[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    history_encoding, memory = self.belief_vae(obs_t, memory * mask_t)[m
+[32m+[m
+[32m+[m[32m                # 2. VAE Encoder q(z | s, h)[m
+[32m+[m[32m                encoder_mean, encoder_std = self.belief_vae.encoder_dist(state_features, history_encoding)[m
+[32m+[m[32m                q = Normal(encoder_mean, encoder_std)[m
+[32m+[m
+[32m+[m[32m                # Learned prior p(z | h)[m
+[32m+[m[32m                prior_mean, prior_std = self.belief_vae.prior_dist(history_encoding)[m
+[32m+[m[32m                p = Normal(prior_mean, prior_std)[m
+[32m+[m[41m                [m
+[32m+[m[32m                # Sample z ~ q(z|s,h)[m
+[32m+[m[32m                zs = encoder_mean + torch.randn_like(encoder_mean) * encoder_std[m
+[32m+[m[41m                [m
+[32m+[m[32m                # 3. VAE Decoder p(s | z, h)[m
+[32m+[m[32m                decoder_mean, decoder_std = self.belief_vae.decoder_dist(zs, history_encoding)[m
+[32m+[m[41m                [m
+[32m+[m[32m                # 4. Calculate ELBO (Monte Carlo Estimate)[m
+[32m+[m[32m                log_px_z = Normal(decoder_mean, decoder_std).log_prob(state_features).sum(dim=-1)[m
+[32m+[m[32m                kl = KL.kl_divergence(q, p).sum(dim=-1)[m
+[32m+[m[41m                [m
+[32m+[m[32m                # Optional action term via flow-matching: predict velocity for noisy action xt[m
+[32m+[m[32m                action_term = 0.0[m
+[32m+[m[32m                if hasattr(sb, "action"):[m
+[32m+[m[32m                    if self.action_flow_head is None:[m
+[32m+[m[32m                        self.action_dim = sb.action.shape[-1][m
+[32m+[m[32m                        self.action_flow_head = nn.Sequential([m
+[32m+[m[32m                            nn.Linear(self.action_dim + 1 + self.belief_vae.context_dim + self.belief_vae.latent_dim, 256),[m
+[32m+[m[32m                            nn.ReLU(),[m
+[32m+[m[32m                            nn.Linear(256, self.action_dim),[m
+[32m+[m[32m                        ).to(self.device)[m
+[32m+[m[32m                        self.vae_optimizer.add_param_group({"params": self.action_flow_head.parameters()})[m
+[32m+[m[32m                    action = sb.action.to(self.device).flatten(start_dim=1)[m
+[32m+[m[32m                    eps = torch.randn_like(action)[m
+[32m+[m[32m                    t_noise = torch.rand(action.shape[0], 1, device=self.device)[m
+[32m+[m[32m                    xt = t_noise * action + (1 - t_noise) * eps[m
+[32m+[m[32m                    v_target = action - eps  # flow matching target[m
+[32m+[m[32m                    act_in = torch.cat([xt, t_noise, history_encoding, zs], dim=1)[m
+[32m+[m[32m                    v_hat = self.action_flow_head(act_in)[m
+[32m+[m[32m                    action_term = F.mse_loss(v_hat, v_target, reduction="none").sum(dim=-1)[m
+[32m+[m[41m                [m
+[32m+[m[32m                # joint objective: recon - beta*KL - lambda_action * FM_loss[m
+[32m+[m[32m                elbo = log_px_z - self.beta * kl - self.lambda_action * action_term[m
+[32m+[m[41m                [m
+[32m+[m[32m                # Accumulate Loss (Masked)[m
+[32m+[m[32m                # Note: Original code sums negative ELBO[m
+[32m+[m[32m                batch_elbo_loss += -(elbo * sb.mask.to(self.device)).sum()[m
+[32m+[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                # All episodes done[m
+[32m+[m[32m                break[m
+[32m+[m
+[32m+[m[32m        # Average over total valid steps[m
+[32m+[m[32m        total_valid_steps = exps.mask.sum()[m
+[32m+[m[32m        if total_valid_steps > 0:[m
+[32m+[m[32m            batch_elbo_loss /= total_valid_steps[m
+[32m+[m
+[32m+[m[32m        # Optimization Step[m
+[32m+[m[32m        self.vae_optimizer.zero_grad()[m
+[32m+[m[32m        batch_elbo_loss.backward()[m
+[32m+[m
+[32m+[m[32m        # Gradient Clipping[m
+[32m+[m[32m        grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in self.belief_vae.parameters() if p.grad is not None) ** 0.5[m
+[32m+[m[32m        # torch.nn.utils.clip_grad_norm_(self.belief_vae.parameters(), self.gradient_threshold) # Threshold default 200[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.vae_optimizer.step()[m
+[32m+[m
+[32m+[m[32m        logs = {"batch_elbo_loss": batch_elbo_loss.item(), "grad_norm": grad_norm}[m
+[32m+[m[32m        return logs[m
+[1mdiff --git a/algo_f_mikasa.py b/algo_f_mikasa.py[m
+[1mnew file mode 100644[m
+[1mindex 0000000..63f36ba[m
+[1m--- /dev/null[m
+[1m+++ b/algo_f_mikasa.py[m
+[36m@@ -0,0 +1,150 @@[m
+[32m+[m[32m"""[m
+[32m+[m[32mMikasa-specific Representation Learning Algorithm.[m
+[32m+[m
+[32m+[m[32mChanges from algo_f.py:[m
+[32m+[m[32m1. Removed dependency on rl_utils (line 5)[m
+[32m+[m[32m2. Removed env parameter (not needed for offline training)[m
+[32m+[m[32m3. Changed data access from DictList (sb.state, sb.obs) to dict (sb['state'], sb['obs'])[m
+[32m+[m[32m4. Model's encode_state/encode_obs now take raw tensors instead of DictList with .image attribute[m
+[32m+[m[32m"""[m
+[32m+[m
+[32m+[m[32mimport numpy[m
+[32m+[m[32mimport torch[m
+[32m+[m[32mfrom torch.distributions.normal import Normal[m
+[32m+[m
+[32m+[m
+[32m+[m[32mclass Algo():[m
+[32m+[m[32m    """Representation Learning Algorithm for Mikasa environments."""[m
+[32m+[m
+[32m+[m[32m    def __init__(self, exps, rep_model, device=None, adam_eps=1e-8, batch_size=256,[m
+[32m+[m[32m                 lr=0.001, beta=0.0001, dynamics_loss_s_coef=0.1, dynamics_loss_o_coef=0.1, reward_loss_coef=0.1, tb_writer=None):[m
+[32m+[m
+[32m+[m[32m        # Removed: self.env = env (not needed for offline training)[m
+[32m+[m[32m        self.exps = exps[m
+[32m+[m[32m        self.device = device[m
+[32m+[m[32m        self.batch_size = batch_size[m
+[32m+[m[32m        self.max_grad_norm = 0.5[m
+[32m+[m[32m        self.beta = beta[m
+[32m+[m[32m        self.dynamics_loss_s_coef = dynamics_loss_s_coef[m
+[32m+[m[32m        self.dynamics_loss_o_coef = dynamics_loss_o_coef[m
+[32m+[m[32m        self.reward_loss_coef = reward_loss_coef[m
+[32m+[m[32m        self.rep_model = rep_model[m
+[32m+[m
+[32m+[m[32m        self.optimizer = torch.optim.Adam(self.rep_model.parameters(), lr, eps=adam_eps)[m
+[32m+[m[32m        self.batch_num = 0[m
+[32m+[m[32m        # Changed: access dict key instead of attribute[m
+[32m+[m[32m        self.num_frames = self.exps['next_mask'].shape[0][m
+[32m+[m
+[32m+[m[32m        self.tb_writer = tb_writer[m
+[32m+[m
+[32m+[m[32m    def update_f_parameters(self):[m
+[32m+[m
+[32m+[m[32m        log_losses = [][m
+[32m+[m[32m        log_state_dynamics_losses = [][m
+[32m+[m[32m        log_obs_dynamics_losses = [][m
+[32m+[m[32m        log_reward_losses = [][m
+[32m+[m[32m        log_kl_losses = [][m
+[32m+[m[32m        log_grad_norms = [][m
+[32m+[m[41m        [m
+[32m+[m[32m        #log_one_rewards = [][m
+[32m+[m
+[32m+[m[32m        for inds in self._get_batches_starting_indexes():[m
+[32m+[m[32m            # Initialize batch values[m
+[32m+[m[32m            batch_loss = 0[m
+[32m+[m[32m            batch_state_dynamics_loss = 0[m
+[32m+[m[32m            batch_obs_dynamics_loss = 0[m
+[32m+[m[32m            batch_reward_loss = 0[m
+[32m+[m[32m            batch_kl_loss = 0[m
+[32m+[m
+[32m+[m[32m            # Changed: Create sub-batch using dict access instead of DictList slicing[m
+[32m+[m[32m            # MEMORY OPTIMIZATION: Convert obs from uint8 to float only when batching[m
+[32m+[m[32m            sb = {}[m
+[32m+[m[32m            for key, val in self.exps.items():[m
+[32m+[m[32m                batch_val = val[inds][m
+[32m+[m[32m                # obs and next_obs are stored as uint8, convert to float here[m
+[32m+[m[32m                if key in ('obs', 'next_obs'):[m
+[32m+[m[32m                    batch_val = batch_val.float()  # uint8 -> float32[m
+[32m+[m[32m                sb[key] = batch_val.to(self.device)[m
+[32m+[m
+[32m+[m[32m            # Changed: Pass tensors directly instead of DictList objects[m
+[32m+[m[32m            # Original: self.rep_model.encode_state(sb.state) where sb.state.image was accessed inside[m
+[32m+[m[32m            # Now: self.rep_model.encode_state(sb['state']) where sb['state'] is the tensor directly[m
+[32m+[m[32m            encoder_mean_s, encoder_std_s = self.rep_model.encode_state(sb['state'])[m
+[32m+[m[32m            encoder_mean_o, encoder_std_o = self.rep_model.encode_obs(sb['obs'])[m
+[32m+[m
+[32m+[m[32m            next_state_preds, next_obs_preds, reward_preds = self.rep_model.predict_next(sb['state'], sb['obs'], sb['action'])[m
+[32m+[m[32m            next_state_targets, _ = self.rep_model.encode_state(sb['next_state'])[m
+[32m+[m[32m            next_obs_targets, _ = self.rep_model.encode_obs(sb['next_obs'])[m
+[32m+[m
+[32m+[m[32m            state_dynamics_loss = torch.pow(torch.norm(next_state_preds - (next_state_targets.detach() * sb['next_mask'].unsqueeze(dim=1)), p=2, dim=1), 2).mean()[m
+[32m+[m[32m            obs_dynamics_loss = torch.pow(torch.norm(next_obs_preds - (next_obs_targets.detach() * sb['next_mask'].unsqueeze(dim=1)), p=2, dim=1), 2).mean()[m
+[32m+[m[32m            reward_loss = torch.pow(sb['reward'].unsqueeze(dim=1) - reward_preds, 2).mean()[m
+[32m+[m
+[32m+[m[32m            # This is E_s[KL(p(Z|S)|| q(Z))] = E_S[E_Z[log(p(Z|S)||q(Z))]][m
+[32m+[m[32m            kl_loss = torch.distributions.kl.kl_divergence(Normal(encoder_mean_s, encoder_std_s),[m
+[32m+[m[32m                                      Normal(torch.zeros_like(encoder_mean_s),[m
+[32m+[m[32m                                             torch.ones_like(encoder_mean_s)))[m
+[32m+[m[41m            [m
+[32m+[m[32m            #log_one_rewards += reward_preds[(sb['reward'] == 1).nonzero()].flatten().tolist()[m
+[32m+[m
+[32m+[m[32m            loss = self.beta * kl_loss + self.dynamics_loss_s_coef * state_dynamics_loss + self.dynamics_loss_o_coef * obs_dynamics_loss + self.reward_loss_coef * reward_loss[m
+[32m+[m[41m            [m
+[32m+[m[32m            # Update batch values[m
+[32m+[m[32m            batch_loss += loss.mean()[m
+[32m+[m[32m            batch_state_dynamics_loss += state_dynamics_loss.item()[m
+[32m+[m[32m            batch_obs_dynamics_loss += obs_dynamics_loss.item()[m
+[32m+[m[32m            batch_reward_loss += reward_loss.item()[m
+[32m+[m[32m            batch_kl_loss += kl_loss.mean().item()[m
+[32m+[m
+[32m+[m[32m            self.optimizer.zero_grad()[m
+[32m+[m[32m            batch_loss.backward()[m
+[32m+[m[32m            grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in self.rep_model.parameters() if p.grad is not None) ** 0.5[m
+[32m+[m[32m            #torch.nn.utils.clip_grad_norm_(self.rep_model.parameters(), self.max_grad_norm)[m
+[32m+[m[32m            self.optimizer.step()[m
+[32m+[m
+[32m+[m[32m            # Update log values[m
+[32m+[m[32m            log_losses.append(batch_loss.item())[m
+[32m+[m[32m            log_state_dynamics_losses.append(batch_state_dynamics_loss)[m
+[32m+[m[32m            log_obs_dynamics_losses.append(batch_obs_dynamics_loss)[m
+[32m+[m[32m            log_reward_losses.append(batch_reward_loss)[m
+[32m+[m[32m            log_kl_losses.append(batch_kl_loss)[m
+[32m+[m[32m            log_grad_norms.append(grad_norm)[m
+[32m+[m[41m        [m
+[32m+[m
+[32m+[m[32m        torch.set_printoptions(sci_mode=False)[m
+[32m+[m[32m        print("Actual rewards:", [round(x.item(), 3) for x in list(sb['reward'][:10])])[m
+[32m+[m[32m        print("Predicted rewards:", [round(x.item(), 3) for x in list(reward_preds[:10])])[m
+[32m+[m
+[32m+[m[32m        logs = {[m
+[32m+[m[32m            "grad_norm": numpy.mean(log_grad_norms),[m
+[32m+[m[32m            "state_dynamics_loss": numpy.mean(log_state_dynamics_losses),[m
+[32m+[m[32m            "obs_dynamics_loss": numpy.mean(log_obs_dynamics_losses),[m
+[32m+[m[32m            "reward_loss": numpy.mean(log_reward_losses),[m
+[32m+[m[32m            "kl_loss": numpy.mean(log_kl_losses)[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m        return logs[m
+[32m+[m
+[32m+[m[32m    def _get_batches_starting_indexes(self):[m
+[32m+[m[32m        """Gives, for each batch, the indexes of the observations given to[m
+[32m+[m[32m        the model and the experiences used to compute the loss at first.[m
+[32m+[m
+[32m+[m[32m        First, the indexes are the integers from 0 to `self.num_frames` with a step of[m
+[32m+[m[32m        `self.recurrence`, shifted by `self.recurrence//2` one time in two for having[m
+[32m+[m[32m        more diverse batches. Then, the indexes are splited into the different batches.[m
+[32m+[m
+[32m+[m[32m        Returns[m
+[32m+[m[32m        -------[m
+[32m+[m[32m        batches_starting_indexes : list of list of int[m
+[32m+[m[32m            the indexes of the experiences to be used at first for each batch[m
+[32m+[m[32m        """[m
+[32m+[m
+[32m+[m[32m        indexes = numpy.arange(0, self.num_frames)[m
+[32m+[m[32m        indexes = numpy.random.permutation(indexes)[m
+[32m+[m
+[32m+[m[32m        self.batch_num += 1[m
+[32m+[m
+[32m+[m[32m        num_indexes = self.batch_size[m
+[32m+[m[32m        batches_starting_indexes = [indexes[i:i+num_indexes] for i in range(0, len(indexes), num_indexes)][m
+[32m+[m
+[32m+[m[32m        return batches_starting_indexes[m
+[1mdiff --git a/algo_vae_pretrain.py b/algo_vae_pretrain.py[m
+[1mindex b1e6284..4f41a03 100644[m
+[1m--- a/algo_vae_pretrain.py[m
+[1m+++ b/algo_vae_pretrain.py[m
+[36m@@ -94,6 +94,8 @@[m [mclass Algo():[m
+ [m
+         history_encodings = [][m
+         batch_elbo_loss = 0[m
+[32m+[m[32m        batch_kl = 0[m
+[32m+[m[32m        batch_recon_nll = 0[m
+         max_steps, num_episodes = exps.mask.shape[0], exps.mask.shape[1][m
+ [m
+         # Initialize memory[m
+[36m@@ -128,8 +130,18 @@[m [mclass Algo():[m
+                 encoder_mean, encoder_std = self.belief_vae.encoder_dist(state_features, history_encoding)[m
+                 zs = encoder_mean + torch.randn_like(encoder_mean) * encoder_std[m
+                 decoder_mean, decoder_std = self.belief_vae.decoder_dist(zs, history_encoding)[m
+[31m-                elbo = prior_dist.log_prob(zs).sum(dim=-1) + Normal(decoder_mean, decoder_std).log_prob(state_features).sum(dim=-1) - Normal(encoder_mean, encoder_std).log_prob(zs).sum(dim=-1)[m
+[31m-                batch_elbo_loss += -(elbo * sb.mask.to(device)).sum() #* torch.pow(torch.tensor(0.95).to(device), step) #[m
+[32m+[m[32m                log_pz = prior_dist.log_prob(zs).sum(dim=-1)[m
+[32m+[m[32m                log_px_z = Normal(decoder_mean, decoder_std).log_prob(state_features).sum(dim=-1)[m
+[32m+[m[32m                log_qz_x = Normal(encoder_mean, encoder_std).log_prob(zs).sum(dim=-1)[m
+[32m+[m
+[32m+[m[32m                elbo = log_pz + log_px_z - log_qz_x[m
+[32m+[m[32m                kl_term = (log_qz_x - log_pz)          # KL(q||p)[m
+[32m+[m[32m                recon_term = (-log_px_z)               # negative log-likelihood[m
+[32m+[m
+[32m+[m[32m                mask = sb.mask.to(device)[m
+[32m+[m[32m                batch_elbo_loss += -(elbo * mask).sum() #* torch.pow(torch.tensor(0.95).to(device), step) #[m
+[32m+[m[32m                batch_kl        += (kl_term * mask).sum()[m
+[32m+[m[32m                batch_recon_nll += (recon_term * mask).sum()[m
+ [m
+                 # Logging[m
+                 if "Genie" in self.env.__class__.__name__:[m
+[36m@@ -147,7 +159,11 @@[m [mclass Algo():[m
+             else:[m
+                 break[m
+ [m
+[31m-        batch_elbo_loss /= exps.mask.sum()[m
+[32m+[m[32m        total_valid_steps = exps.mask.sum()[m
+[32m+[m[32m        if total_valid_steps > 0:[m
+[32m+[m[32m            batch_elbo_loss /= total_valid_steps[m
+[32m+[m[32m            batch_kl        /= total_valid_steps[m
+[32m+[m[32m            batch_recon_nll /= total_valid_steps[m
+ [m
+         self.vae_optimizer.zero_grad()[m
+         batch_elbo_loss.backward()[m
+[36m@@ -158,5 +174,11 @@[m [mclass Algo():[m
+ [m
+         self.vae_optimizer.step()[m
+ [m
+[31m-        logs = {"batch_elbo_loss": batch_elbo_loss}[m
+[32m+[m[32m        logs = {[m
+[32m+[m[32m            "batch_elbo_loss": batch_elbo_loss.item(),[m
+[32m+[m[32m            "batch_kl": batch_kl.item() if total_valid_steps > 0 else 0.0,[m
+[32m+[m[32m            "batch_recon_nll": batch_recon_nll.item() if total_valid_steps > 0 else 0.0,[m
+[32m+[m[32m            "grad_norm": grad_norm,[m
+[32m+[m[32m            "total_valid_steps": total_valid_steps.item(),[m
+[32m+[m[32m        }[m
+         return logs[m
+[1mdiff --git a/algo_vae_pretrain_mikasa.py b/algo_vae_pretrain_mikasa.py[m
+[1mnew file mode 100644[m
+[1mindex 0000000..91978b8[m
+[1m--- /dev/null[m
+[1m+++ b/algo_vae_pretrain_mikasa.py[m
+[36m@@ -0,0 +1,154 @@[m
+[32m+[m[32mimport torch[m
+[32m+[m[32mimport numpy[m
+[32m+[m[32mfrom torch.distributions.normal import Normal[m
+[32m+[m[32mfrom torch_ac.utils import DictList[m
+[32m+[m[32mfrom rl_utils import device[m
+[32m+[m
+[32m+[m[32mclass Algo():[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Mikasa-specific VAE Pretraining Algo.[m
+[32m+[m[32m    Adapted from algo_vae_pretrain.py with minimal changes to logic flow.[m
+[32m+[m[32m    """[m
+[32m+[m
+[32m+[m[32m    def __init__(self, env, device=None, adam_eps=1e-8, preprocess_obss=None, lr_g=0.0003, epochs_g=16, rep_model=None,[m
+[32m+[m[32m                 latent_dim=8, latent_dim_f=16, beta=0.0001, gradient_threshold=200, tb_writer=None, use_cnn=False):[m
+[32m+[m
+[32m+[m[32m        self.env = env[m
+[32m+[m[32m        self.device = device[m
+[32m+[m[32m        self.epochs_g = epochs_g[m
+[32m+[m[32m        self.latent_dim = latent_dim[m
+[32m+[m[32m        self.gradient_threshold = gradient_threshold[m
+[32m+[m[32m        self.rep_model = rep_model[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Mikasa VAE model passed as belief_vae? Or initialized here?[m
+[32m+[m[32m        # In pretrain_vae_mikasa.py we pass env, rep_model etc.[m
+[32m+[m[32m        # But we need to use the passed belief_vae if possible, or init it.[m
+[32m+[m[32m        # Original code inits belief_vae inside __init__.[m
+[32m+[m[32m        # But for Mikasa we might want to pass it or init it with specific params.[m
+[32m+[m[32m        # Let's assume pretrain_vae_mikasa.py passes the model via a hack or we adapt __init__ signature.[m
+[32m+[m[32m        # WAIT: pretrain_vae_mikasa.py calls Algo(env, device, ...). It DOES NOT pass belief_vae instance directly in original code style.[m
+[32m+[m[32m        # BUT I modified pretrain_vae_mikasa.py to pass specific args.[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Let's check how I modified pretrain_vae_mikasa.py:[m
+[32m+[m[32m        # algo = algo_vae_pretrain.Algo([m
+[32m+[m[32m        #    belief_vae=vae_model, ...[m
+[32m+[m[32m        # )[m
+[32m+[m[32m        # So I changed the signature in my previous response.[m
+[32m+[m[32m        # Let's update this file's __init__ to accept belief_vae directly to be cleaner.[m
+[32m+[m[32m        pass[m
+[32m+[m
+[32m+[m[32m    # Re-defining __init__ to match the usage in pretrain_vae_mikasa.py[m
+[32m+[m[32m    def __init__(self, belief_vae, rep_model=None, device=None, lr_g=0.0003, adam_eps=1e-8, batch_size_g=128, history_recurrence=16, beta=0.0001):[m
+[32m+[m[32m        self.belief_vae = belief_vae[m
+[32m+[m[32m        self.device = device[m
+[32m+[m[32m        self.batch_size_g = batch_size_g[m
+[32m+[m[32m        self.history_recurrence = history_recurrence[m
+[32m+[m[32m        self.beta = beta[m
+[32m+[m[32m        self.rep_model = rep_model[m
+[32m+[m[32m        self.epochs_g = 1 # Added to match loop usage if needed, or controlled outside[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.vae_optimizer = torch.optim.Adam(self.belief_vae.parameters(), lr_g, eps=adam_eps)[m
+[32m+[m
+[32m+[m[32m    def update_g_parameters(self, exps):[m
+[32m+[m[32m        # exps: DictList with obs, state, mask.[m
+[32m+[m[32m        # Dimensions: (T, B, ...)[m
+[32m+[m[41m        [m
+[32m+[m[32m        batch_elbo_loss = 0[m
+[32m+[m[32m        batch_kl = 0[m
+[32m+[m[32m        batch_recon_nll = 0[m
+[32m+[m[41m        [m
+[32m+[m[32m        # exps.mask shape: (T, B)[m
+[32m+[m[32m        max_steps, num_episodes = exps.mask.shape[0], exps.mask.shape[1][m
+[32m+[m
+[32m+[m[32m        # Initialize memory[m
+[32m+[m[32m        # Mikasa VAE memory size[m
+[32m+[m[32m        memory = torch.zeros((num_episodes, self.belief_vae.history_model.memory_size)).to(self.device)[m
+[32m+[m
+[32m+[m[32m        # Main Loop over time[m
+[32m+[m[32m        for step in range(max_steps):[m
+[32m+[m[32m            sb = exps[step] # Sub-batch at time step[m
+[32m+[m
+[32m+[m[32m            # Check if any episode is active[m
+[32m+[m[32m            if sb.mask.sum() > 0:[m
+[32m+[m[32m                with torch.no_grad():[m
+[32m+[m[32m                    # Get State Features (Ground Truth State)[m
+[32m+[m[32m                    # Mikasa state is already a vector, just flatten if needed[m
+[32m+[m[32m                    if self.rep_model is not None:[m
+[32m+[m[32m                        rep_encoder_mean, rep_encoder_std = self.rep_model.encode_state(sb.state)[m
+[32m+[m[32m                        state_features = rep_encoder_mean[m
+[32m+[m[32m                    else:[m
+[32m+[m[32m                        state_features = sb.state.to(self.device).flatten(start_dim=1)[m
+[32m+[m
+[32m+[m[32m                # Prior p(z) ~ N(0, 1)[m
+[32m+[m[32m                prior_dist = Normal(0, 1)[m
+[32m+[m
+[32m+[m[32m                # 1. Forward History / Update Memory[m
+[32m+[m[32m                # Note: Original code detaches memory every 16 steps?[m
+[32m+[m[32m                # "if step % 16 == 0: ... memory.detach() ..."[m
+[32m+[m[32m                # This implements truncated BPTT.[m
+[32m+[m[41m                [m
+[32m+[m[32m                obs_t = sb.obs.to(self.device)[m
+[32m+[m[32m                mask_t = sb.mask.to(self.device).unsqueeze(dim=1)[m
+[32m+[m[41m                [m
+[32m+[m[32m                if step % 16 == 0:[m
+[32m+[m[32m                    history_encoding, memory = self.belief_vae(obs_t, memory.detach() * mask_t)[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    history_encoding, memory = self.belief_vae(obs_t, memory * mask_t)[m
+[32m+[m
+[32m+[m[32m                # 2. VAE Encoder q(z | s, h)[m
+[32m+[m[32m                encoder_mean, encoder_std = self.belief_vae.encoder_dist(state_features, history_encoding)[m
+[32m+[m[41m                [m
+[32m+[m[32m                # Sample z[m
+[32m+[m[32m                zs = encoder_mean + torch.randn_like(encoder_mean) * encoder_std[m
+[32m+[m[41m                [m
+[32m+[m[32m                # 3. VAE Decoder p(s | z, h)[m
+[32m+[m[32m                decoder_mean, decoder_std = self.belief_vae.decoder_dist(zs, history_encoding)[m
+[32m+[m[41m                [m
+[32m+[m[32m                # 4. Calculate ELBO (Monte Carlo Estimate)[m
+[32m+[m[32m                # elbo = log p(z) + log p(s|z, h) - log q(z|s, h)[m
+[32m+[m[41m                [m
+[32m+[m[32m                log_pz = prior_dist.log_prob(zs).sum(dim=-1)[m
+[32m+[m[32m                log_px_z = Normal(decoder_mean, decoder_std).log_prob(state_features).sum(dim=-1)[m
+[32m+[m[32m                log_qz_x = Normal(encoder_mean, encoder_std).log_prob(zs).sum(dim=-1)[m
+[32m+[m[41m                [m
+[32m+[m[32m                # ELBO = log_pz + log_px_z - log_qz_x[m
+[32m+[m[32m                elbo = log_pz + log_px_z - log_qz_x[m
+[32m+[m[32m                kl_term = (log_qz_x - log_pz)          # KL(q||p)[m
+[32m+[m[32m                recon_term = (-log_px_z)               # negative log-likelihood[m
+[32m+[m[41m                [m
+[32m+[m[32m                # Accumulate Loss (Masked)[m
+[32m+[m[32m                # Note: Original code sums negative ELBO[m
+[32m+[m[32m                mask = sb.mask.to(self.device)[m
+[32m+[m[32m                batch_elbo_loss += -(elbo * mask).sum()[m
+[32m+[m[32m                batch_kl        += (kl_term * mask).sum()[m
+[32m+[m[32m                batch_recon_nll += (recon_term * mask).sum()[m
+[32m+[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                # All episodes done[m
+[32m+[m[32m                break[m
+[32m+[m
+[32m+[m[32m        # Average over total valid steps[m
+[32m+[m[32m        total_valid_steps = exps.mask.sum()[m
+[32m+[m[32m        if total_valid_steps > 0:[m
+[32m+[m[32m            batch_elbo_loss /= total_valid_steps[m
+[32m+[m[32m            batch_kl        /= total_valid_steps[m
+[32m+[m[32m            batch_recon_nll /= total_valid_steps[m
+[32m+[m
+[32m+[m[32m        # Optimization Step[m
+[32m+[m[32m        self.vae_optimizer.zero_grad()[m
+[32m+[m[32m        batch_elbo_loss.backward()[m
+[32m+[m
+[32m+[m[32m        # Gradient Clipping[m
+[32m+[m[32m        grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in self.belief_vae.parameters() if p.grad is not None) ** 0.5[m
+[32m+[m[32m        # torch.nn.utils.clip_grad_norm_(self.belief_vae.parameters(), self.gradient_threshold) # Threshold default 200[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.vae_optimizer.step()[m
+[32m+[m
+[32m+[m[32m        logs = {[m
+[32m+[m[32m            "batch_elbo_loss": batch_elbo_loss.item(),[m
+[32m+[m[32m            "batch_kl": batch_kl.item() if total_valid_steps > 0 else 0.0,[m
+[32m+[m[32m            "batch_recon_nll": batch_recon_nll.item() if total_valid_steps > 0 else 0.0,[m
+[32m+[m[32m            "grad_norm": grad_norm,[m
+[32m+[m[32m            "total_valid_steps": total_valid_steps.item(),[m
+[32m+[m[32m        }[m
+[32m+[m[32m        return logs[m
+[1mdiff --git a/analyze_state_distribution.py b/analyze_state_distribution.py[m
+[1mnew file mode 100644[m
+[1mindex 0000000..7fd0d26[m
+[1m--- /dev/null[m
+[1m+++ b/analyze_state_distribution.py[m
+[36m@@ -0,0 +1,254 @@[m
+[32m+[m[32mimport argparse[m
+[32m+[m[32mimport math[m
+[32m+[m[32mimport os[m
+[32m+[m[32mfrom typing import Dict, List, Tuple[m
+[32m+[m
+[32m+[m[32mimport torch[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _parse_floats(csv: str) -> List[float]:[m
+[32m+[m[32m    return [float(x.strip()) for x in csv.split(",") if x.strip() != ""][m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _format_float(x: float) -> str:[m
+[32m+[m[32m    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):[m
+[32m+[m[32m        return str(x)[m
+[32m+[m[32m    ax = abs(x)[m
+[32m+[m[32m    if ax != 0 and (ax >= 1e6 or ax < 1e-4):[m
+[32m+[m[32m        return f"{x:.3e}"[m
+[32m+[m[32m    return f"{x:.6f}"[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _summarize_tensor_1d(x: torch.Tensor, quantiles: torch.Tensor) -> Dict[str, torch.Tensor]:[m
+[32m+[m[32m    # x: (N,)[m
+[32m+[m[32m    out: Dict[str, torch.Tensor] = {}[m
+[32m+[m[32m    out["count"] = torch.tensor([x.numel()], dtype=torch.int64)[m
+[32m+[m[32m    out["nan"] = torch.isnan(x).sum().to(torch.int64)[m
+[32m+[m[32m    out["inf"] = torch.isinf(x).sum().to(torch.int64)[m
+[32m+[m[32m    finite = x[torch.isfinite(x)][m
+[32m+[m[32m    out["finite_count"] = torch.tensor([finite.numel()], dtype=torch.int64)[m
+[32m+[m[32m    if finite.numel() == 0:[m
+[32m+[m[32m        out["mean"] = torch.tensor([float("nan")])[m
+[32m+[m[32m        out["std"] = torch.tensor([float("nan")])[m
+[32m+[m[32m        out["min"] = torch.tensor([float("nan")])[m
+[32m+[m[32m        out["max"] = torch.tensor([float("nan")])[m
+[32m+[m[32m        out["quantiles"] = torch.full((quantiles.numel(),), float("nan"))[m
+[32m+[m[32m        return out[m
+[32m+[m[32m    out["mean"] = finite.mean()[m
+[32m+[m[32m    out["std"] = finite.std(unbiased=False)[m
+[32m+[m[32m    out["min"] = finite.min()[m
+[32m+[m[32m    out["max"] = finite.max()[m
+[32m+[m[32m    out["quantiles"] = torch.quantile(finite, quantiles)[m
+[32m+[m[32m    return out[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _idx_to_episode_step(flat_idx: torch.Tensor, episode_len: int) -> Tuple[torch.Tensor, torch.Tensor]:[m
+[32m+[m[32m    ep = flat_idx // episode_len[m
+[32m+[m[32m    t = flat_idx % episode_len[m
+[32m+[m[32m    return ep, t[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef main() -> None:[m
+[32m+[m[32m    parser = argparse.ArgumentParser(description="Analyze distribution of `states` in a Sphinx-format .pt dataset.")[m
+[32m+[m[32m    parser.add_argument([m
+[32m+[m[32m        "--data-path",[m
+[32m+[m[32m        type=str,[m
+[32m+[m[32m        default="data/collect_RememberShapeAndColor3x2-v0.pt",[m
+[32m+[m[32m        help="Path to dataset .pt (expects keys: states, masks).",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    parser.add_argument([m
+[32m+[m[32m        "--quantiles",[m
+[32m+[m[32m        type=str,[m
+[32m+[m[32m        default="0,0.001,0.01,0.05,0.5,0.95,0.99,0.999,1",[m
+[32m+[m[32m        help="Comma-separated quantiles to compute.",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    parser.add_argument([m
+[32m+[m[32m        "--topk",[m
+[32m+[m[32m        type=int,[m
+[32m+[m[32m        default=20,[m
+[32m+[m[32m        help="How many global extreme values (by abs) to print with indices.",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    parser.add_argument([m
+[32m+[m[32m        "--thresholds",[m
+[32m+[m[32m        type=str,[m
+[32m+[m[32m        default="1,10,100,1000,10000",[m
+[32m+[m[32m        help="Comma-separated |x| thresholds to count per-dimension.",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    parser.add_argument([m
+[32m+[m[32m        "--sentinels",[m
+[32m+[m[32m        type=str,[m
+[32m+[m[32m        default="1000,4242424242",[m
+[32m+[m[32m        help="Comma-separated sentinel values to count (exact match after casting).",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    args = parser.parse_args()[m
+[32m+[m
+[32m+[m[32m    data_path = args.data_path[m
+[32m+[m[32m    if not os.path.exists(data_path):[m
+[32m+[m[32m        raise FileNotFoundError(f"Dataset not found: {data_path}")[m
+[32m+[m
+[32m+[m[32m    print(f"Loading: {data_path}")[m
+[32m+[m[32m    data = torch.load(data_path, map_location="cpu")[m
+[32m+[m[32m    if not isinstance(data, dict):[m
+[32m+[m[32m        raise TypeError(f"Expected torch.load(...) to return dict, got {type(data)}")[m
+[32m+[m
+[32m+[m[32m    print("Keys:", sorted(list(data.keys())))[m
+[32m+[m[32m    if "states" not in data:[m
+[32m+[m[32m        raise KeyError("Dataset does not contain key 'states'")[m
+[32m+[m[32m    states = data["states"][m
+[32m+[m[32m    masks = data.get("masks", None)[m
+[32m+[m
+[32m+[m[32m    if not torch.is_tensor(states):[m
+[32m+[m[32m        raise TypeError(f"'states' must be a torch.Tensor, got {type(states)}")[m
+[32m+[m[32m    if states.ndim != 3:[m
+[32m+[m[32m        raise ValueError(f"Expected states shape (N, T, D), got {tuple(states.shape)}")[m
+[32m+[m[32m    n_ep, ep_len, d = states.shape[m
+[32m+[m[32m    print(f"states: shape={tuple(states.shape)} dtype={states.dtype} device={states.device}")[m
+[32m+[m
+[32m+[m[32m    if masks is None:[m
+[32m+[m[32m        print("masks: (missing) -> treating all steps as valid")[m
+[32m+[m[32m        valid_mask_flat = torch.ones(n_ep * ep_len, dtype=torch.bool)[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        if not torch.is_tensor(masks):[m
+[32m+[m[32m            raise TypeError(f"'masks' must be a torch.Tensor, got {type(masks)}")[m
+[32m+[m[32m        if masks.shape[:2] != states.shape[:2]:[m
+[32m+[m[32m            raise ValueError(f"masks shape {tuple(masks.shape)} does not match states shape[:2] {tuple(states.shape[:2])}")[m
+[32m+[m[32m        valid_mask_flat = (masks.reshape(-1).float() > 0.5)[m
+[32m+[m[32m        print(f"masks: shape={tuple(masks.shape)} dtype={masks.dtype} valid_steps={int(valid_mask_flat.sum().item())}/{valid_mask_flat.numel()}")[m
+[32m+[m
+[32m+[m[32m    # Flatten to (N*T, D)[m
+[32m+[m[32m    states_flat = states.reshape(-1, d).to(torch.float32)[m
+[32m+[m[32m    valid_indices = valid_mask_flat.nonzero(as_tuple=False).squeeze(1)[m
+[32m+[m[32m    valid_states = states_flat[valid_mask_flat][m
+[32m+[m[32m    print(f"valid_states: shape={tuple(valid_states.shape)} dtype={valid_states.dtype}")[m
+[32m+[m
+[32m+[m[32m    # Basic sanity checks[m
+[32m+[m[32m    any_nan = torch.isnan(valid_states).any().item()[m
+[32m+[m[32m    any_inf = torch.isinf(valid_states).any().item()[m
+[32m+[m[32m    print(f"Contains NaN: {any_nan} | Contains Inf: {any_inf}")[m
+[32m+[m
+[32m+[m[32m    # Global outliers across ALL dims[m
+[32m+[m[32m    topk = max(0, int(args.topk))[m
+[32m+[m[32m    if topk > 0:[m
+[32m+[m[32m        abs_all = valid_states.abs().reshape(-1)[m
+[32m+[m[32m        k = min(topk, abs_all.numel())[m
+[32m+[m[32m        top_vals, top_idx = torch.topk(abs_all, k=k, largest=True, sorted=True)[m
+[32m+[m[32m        row_idx = top_idx // d[m
+[32m+[m[32m        dim_idx = top_idx % d[m
+[32m+[m[32m        orig_flat_idx = valid_indices[row_idx][m
+[32m+[m[32m        ep_idx, t_idx = _idx_to_episode_step(orig_flat_idx, ep_len)[m
+[32m+[m[32m        print("\n=== Global top-|x| values (across all dims) ===")[m
+[32m+[m[32m        for i in range(k):[m
+[32m+[m[32m            v = valid_states[row_idx[i], dim_idx[i]].item()[m
+[32m+[m[32m            av = top_vals[i].item()[m
+[32m+[m[32m            print([m
+[32m+[m[32m                f"#{i+1:02d} | abs={_format_float(av)} val={_format_float(v)} | "[m
+[32m+[m[32m                f"ep={int(ep_idx[i])} t={int(t_idx[i])} dim={int(dim_idx[i])}"[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m    # Per-dimension summary[m
+[32m+[m[32m    q_list = _parse_floats(args.quantiles)[m
+[32m+[m[32m    q = torch.tensor(q_list, dtype=torch.float32)[m
+[32m+[m
+[32m+[m[32m    # Compute mean/std/min/max per dim on finite only[m
+[32m+[m[32m    finite_mask = torch.isfinite(valid_states)[m
+[32m+[m[32m    finite_counts = finite_mask.sum(dim=0).to(torch.int64)[m
+[32m+[m[32m    nan_counts = torch.isnan(valid_states).sum(dim=0).to(torch.int64)[m
+[32m+[m[32m    inf_counts = torch.isinf(valid_states).sum(dim=0).to(torch.int64)[m
+[32m+[m
+[32m+[m[32m    # Replace non-finite with 0 for sums; track counts.[m
+[32m+[m[32m    safe = torch.where(finite_mask, valid_states, torch.zeros_like(valid_states))[m
+[32m+[m[32m    means = safe.sum(dim=0) / torch.clamp(finite_counts.to(torch.float32), min=1.0)[m
+[32m+[m[32m    # variance = E[x^2] - (E[x])^2[m
+[32m+[m[32m    ex2 = (safe * safe).sum(dim=0) / torch.clamp(finite_counts.to(torch.float32), min=1.0)[m
+[32m+[m[32m    vars_ = ex2 - means * means[m
+[32m+[m[32m    vars_ = torch.clamp(vars_, min=0.0)[m
+[32m+[m[32m    stds = torch.sqrt(vars_)[m
+[32m+[m
+[32m+[m[32m    # min/max: compute on finite values only by masking with +/-inf[m
+[32m+[m[32m    pos_inf = torch.tensor(float("inf"))[m
+[32m+[m[32m    neg_inf = torch.tensor(float("-inf"))[m
+[32m+[m[32m    masked_for_min = torch.where(finite_mask, valid_states, pos_inf)[m
+[32m+[m[32m    masked_for_max = torch.where(finite_mask, valid_states, neg_inf)[m
+[32m+[m[32m    mins = masked_for_min.min(dim=0).values[m
+[32m+[m[32m    maxs = masked_for_max.max(dim=0).values[m
+[32m+[m
+[32m+[m[32m    # Quantiles per dim (can be slow but D is small)[m
+[32m+[m[32m    # We compute each dim separately so we only sort finite values.[m
+[32m+[m[32m    quantiles_per_dim = torch.empty((q.numel(), d), dtype=torch.float32)[m
+[32m+[m[32m    for dim in range(d):[m
+[32m+[m[32m        col = valid_states[:, dim][m
+[32m+[m[32m        col = col[torch.isfinite(col)][m
+[32m+[m[32m        if col.numel() == 0:[m
+[32m+[m[32m            quantiles_per_dim[:, dim] = float("nan")[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            quantiles_per_dim[:, dim] = torch.quantile(col, q)[m
+[32m+[m
+[32m+[m[32m    print("\n=== Per-dimension summary (valid steps only) ===")[m
+[32m+[m[32m    header_q = " ".join([f"q{qq:g}" for qq in q_list])[m
+[32m+[m[32m    print(f"dim | mean std min max | nan inf | {header_q}")[m
+[32m+[m[32m    for dim in range(d):[m
+[32m+[m[32m        qvals = " ".join([_format_float(x.item()) for x in quantiles_per_dim[:, dim]])[m
+[32m+[m[32m        print([m
+[32m+[m[32m            f"{dim:02d} | "[m
+[32m+[m[32m            f"{_format_float(means[dim].item())} "[m
+[32m+[m[32m            f"{_format_float(stds[dim].item())} "[m
+[32m+[m[32m            f"{_format_float(mins[dim].item())} "[m
+[32m+[m[32m            f"{_format_float(maxs[dim].item())} | "[m
+[32m+[m[32m            f"{int(nan_counts[dim])} {int(inf_counts[dim])} | "[m
+[32m+[m[32m            f"{qvals}"[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    # Threshold counts per dim[m
+[32m+[m[32m    thresholds = _parse_floats(args.thresholds)[m
+[32m+[m[32m    if thresholds:[m
+[32m+[m[32m        print("\n=== Per-dimension |x| threshold counts (valid steps only) ===")[m
+[32m+[m[32m        for thr in thresholds:[m
+[32m+[m[32m            cnt = (valid_states.abs() > thr).sum(dim=0).to(torch.int64)[m
+[32m+[m[32m            total = valid_states.shape[0][m
+[32m+[m[32m            # print compact: dims where count > 0[m
+[32m+[m[32m            dims = [(i, int(cnt[i])) for i in range(d) if int(cnt[i]) > 0][m
+[32m+[m[32m            dims_str = ", ".join([f"d{i}:{c}" for i, c in dims[:40]])[m
+[32m+[m[32m            more = "" if len(dims) <= 40 else f" ... (+{len(dims)-40} dims)"[m
+[32m+[m[32m            print(f"|x| > {thr:g}: {len(dims)}/{d} dims have outliers (total_rows={total}); {dims_str}{more}")[m
+[32m+[m
+[32m+[m[32m    # Sentinel counts per dim[m
+[32m+[m[32m    sentinels = _parse_floats(args.sentinels)[m
+[32m+[m[32m    if sentinels:[m
+[32m+[m[32m        print("\n=== Per-dimension sentinel exact-match counts (valid steps only) ===")[m
+[32m+[m[32m        for s in sentinels:[m
+[32m+[m[32m            s_tensor = torch.tensor(s, dtype=valid_states.dtype)[m
+[32m+[m[32m            cnt = (valid_states == s_tensor).sum(dim=0).to(torch.int64)[m
+[32m+[m[32m            dims = [(i, int(cnt[i])) for i in range(d) if int(cnt[i]) > 0][m
+[32m+[m[32m            dims_str = ", ".join([f"d{i}:{c}" for i, c in dims[:40]])[m
+[32m+[m[32m            more = "" if len(dims) <= 40 else f" ... (+{len(dims)-40} dims)"[m
+[32m+[m[32m            total = int(cnt.sum().item())[m
+[32m+[m[32m            print(f"value == {s:g}: total_matches={total}; {dims_str}{more}")[m
+[32m+[m
+[32m+[m[32m    # Step-wise max-|x| diagnostics (helps locate time-local outliers)[m
+[32m+[m[32m    if masks is not None:[m
+[32m+[m[32m        max_abs_per_t = [][m
+[32m+[m[32m        for t in range(ep_len):[m
+[32m+[m[32m            m_t = (masks[:, t].float() > 0.5)[m
+[32m+[m[32m            if int(m_t.sum().item()) == 0:[m
+[32m+[m[32m                max_abs_per_t.append(float("nan"))[m
+[32m+[m[32m                continue[m
+[32m+[m[32m            st_t = states[:, t, :].to(torch.float32)[m_t][m
+[32m+[m[32m            max_abs_per_t.append(float(st_t.abs().max().item()))[m
+[32m+[m[32m        max_abs_t = torch.tensor(max_abs_per_t)[m
+[32m+[m[32m        top_tk = min(10, ep_len)[m
+[32m+[m[32m        # ignore NaNs by replacing with -inf[m
+[32m+[m[32m        max_abs_t_safe = torch.where(torch.isnan(max_abs_t), torch.tensor(float("-inf")), max_abs_t)[m
+[32m+[m[32m        top_vals_t, top_idx_t = torch.topk(max_abs_t_safe, k=top_tk, largest=True, sorted=True)[m
+[32m+[m[32m        print("\n=== Step-wise max |x| (top steps) ===")[m
+[32m+[m[32m        for i in range(top_tk):[m
+[32m+[m[32m            t = int(top_idx_t[i].item())[m
+[32m+[m[32m            v = float(top_vals_t[i].item())[m
+[32m+[m[32m            if math.isinf(v) and v < 0:[m
+[32m+[m[32m                continue[m
+[32m+[m[32m            print(f"t={t:03d} max_abs={_format_float(v)}")[m
+[32m+[m
+[32m+[m
+[32m+[m[32mif __name__ == "__main__":[m
+[32m+[m[32m    main()[m
+[32m+[m
+[32m+[m
+[1mdiff --git a/create_subset.py b/create_subset.py[m
+[1mnew file mode 100644[m
+[1mindex 0000000..e1f7ae0[m
+[1m--- /dev/null[m
+[1m+++ b/create_subset.py[m
+[36m@@ -0,0 +1,62 @@[m
+[32m+[m[32mimport torch[m
+[32m+[m[32mimport os[m
+[32m+[m
+[32m+[m[32m# ================= 配置部分 =================[m
+[32m+[m[32m# 原始数据文件路径 (请修改为你实际的 .pt 文件路径)[m
+[32m+[m[32minput_path = "/local/s4176650/sphinx/data/collect_RememberShapeAndColor3x2-v0.pt"[m
+[32m+[m
+[32m+[m[32m# 新的小数据集保存路径[m
+[32m+[m[32moutput_path = "/local/s4176650/sphinx/data/collect_RememberShapeAndColor3x2-v0_500ep.pt"[m
+[32m+[m
+[32m+[m[32m# 目标 episode 数量[m
+[32m+[m[32mTARGET_EPISODES = 500[m
+[32m+[m[32m# ===========================================[m
+[32m+[m
+[32m+[m[32mprint(f"Loading data from {input_path}...")[m
+[32m+[m[32mtry:[m
+[32m+[m[32m    data = torch.load(input_path)[m
+[32m+[m[32mexcept FileNotFoundError:[m
+[32m+[m[32m    print(f"Error: File not found at {input_path}")[m
+[32m+[m[32m    exit(1)[m
+[32m+[m
+[32m+[m[32m# 定义需要处理的键 (基于 get_random_datasets_full_state.py 的输出)[m
+[32m+[m[32mkeys_to_slice = ["obss", "states", "joints", "actions", "rewards", "masks"][m
+[32m+[m
+[32m+[m[32mnew_data = {}[m
+[32m+[m[32moriginal_count = 0[m
+[32m+[m
+[32m+[m[32m# 检查是否存在至少一个键来确定原始数据长度[m
+[32m+[m[32mif "obss" in data:[m
+[32m+[m[32m    original_count = data["obss"].shape[0][m
+[32m+[m[32melse:[m
+[32m+[m[32m    # 尝试用其他键推断[m
+[32m+[m[32m    for key in keys_to_slice:[m
+[32m+[m[32m        if key in data:[m
+[32m+[m[32m            original_count = data[key].shape[0][m
+[32m+[m[32m            break[m
+[32m+[m
+[32m+[m[32mprint(f"Original dataset contains {original_count} episodes.")[m
+[32m+[m
+[32m+[m[32mif original_count < TARGET_EPISODES:[m
+[32m+[m[32m    print(f"Warning: Original dataset is smaller than target ({original_count} < {TARGET_EPISODES}). Copying full dataset.")[m
+[32m+[m[32m    TARGET_EPISODES = original_count[m
+[32m+[m
+[32m+[m[32mprint(f"Slicing data to keep first {TARGET_EPISODES} episodes...")[m
+[32m+[m
+[32m+[m[32mfor key, value in data.items():[m
+[32m+[m[32m    if key in keys_to_slice:[m
+[32m+[m[32m        if torch.is_tensor(value):[m
+[32m+[m[32m            # 假设第一维是 Episode (N, T, ...)[m
+[32m+[m[32m            new_data[key] = value[:TARGET_EPISODES][m
+[32m+[m[32m            print(f"  Processed '{key}': {value.shape} -> {new_data[key].shape}")[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            print(f"  Warning: Key '{key}' is in target list but is not a tensor. Copied as is.")[m
+[32m+[m[32m            new_data[key] = value[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        # 对于不在列表中的其他元数据，直接复制[m
+[32m+[m[32m        print(f"  Copying metadata key '{key}' as is.")[m
+[32m+[m[32m        new_data[key] = value[m
+[32m+[m
+[32m+[m[32mprint(f"\nSaving new dataset to {output_path}...")[m
+[32m+[m[32mtorch.save(new_data, output_path)[m
+[32m+[m[32mprint("Done!")[m
+\ No newline at end of file[m
+[1mdiff --git a/model_cvae_mikasa.py b/model_cvae_mikasa.py[m
+[1mnew file mode 100644[m
+[1mindex 0000000..8699dc1[m
+[1m--- /dev/null[m
+[1m+++ b/model_cvae_mikasa.py[m
+[36m@@ -0,0 +1,212 @@[m
+[32m+[m[32mimport torch[m
+[32m+[m[32mimport torch.nn as nn[m
+[32m+[m[32mimport torch.nn.functional as F[m
+[32m+[m[32mfrom torch.distributions.normal import Normal[m
+[32m+[m[32mfrom rl_utils.other import device[m
+[32m+[m
+[32m+[m[32m# Function from https://github.com/ikostrikov/pytorch-a2c-ppo-acktr/blob/master/model.py[m
+[32m+[m[32mdef init_params(m):[m
+[32m+[m[32m    classname = m.__class__.__name__[m
+[32m+[m[32m    if classname.find("Linear") != -1:[m
+[32m+[m[32m        m.weight.data.normal_(0, 1)[m
+[32m+[m[32m        m.weight.data *= 1 / torch.sqrt(m.weight.data.pow(2).sum(1, keepdim=True))[m
+[32m+[m[32m        if m.bias is not None:[m
+[32m+[m[32m            m.bias.data.fill_(0)[m
+[32m+[m
+[32m+[m[32mclass ImageEncoder(nn.Module):[m
+[32m+[m[32m    """[m
+[32m+[m[32m    NatureCNN for 128x128x3 RGB images.[m
+[32m+[m[32m    """[m
+[32m+[m[32m    def __init__(self, obs_space):[m
+[32m+[m[32m        super().__init__()[m
+[32m+[m[32m        # obs_space is expected to be a dict with 'image' shape (H, W, C) or just shape tuple[m
+[32m+[m[32m        # But for compatibility with NatureCNN structure:[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.embedding_size = 512[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.cnn = nn.Sequential([m
+[32m+[m[32m            nn.Conv2d(3, 32, kernel_size=8, stride=4, padding=0),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Flatten(),[m
+[32m+[m[32m        )[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Calculate output size for 128x128 input[m
+[32m+[m[32m        # 128 -> 31 -> 14 -> 12.  64 * 12 * 12 = 9216[m
+[32m+[m[32m        with torch.no_grad():[m
+[32m+[m[32m            dummy = torch.zeros(1, 3, 128, 128)[m
+[32m+[m[32m            out_size = self.cnn(dummy).shape[1][m
+[32m+[m[41m            [m
+[32m+[m[32m        self.fc = nn.Sequential([m
+[32m+[m[32m            nn.Linear(out_size, self.embedding_size),[m
+[32m+[m[32m            nn.ReLU()[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    def forward(self, obs):[m
+[32m+[m[32m        # Input obs: (B, H, W, C) expected by original code usually?[m
+[32m+[m[32m        # Or (B, C, H, W)?[m
+[32m+[m[32m        # Original code uses obs.image.[m
+[32m+[m[41m        [m
+[32m+[m[32m        if torch.is_tensor(obs):[m
+[32m+[m[32m            x = obs[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            x = obs.image[m
+[32m+[m[41m            [m
+[32m+[m[32m        # Expecting (B, H, W, C) from environment, need (B, C, H, W) for Conv2d[m
+[32m+[m[32m        # Check if channel is last[m
+[32m+[m[32m        if x.shape[-1] == 3:[m
+[32m+[m[32m            x = x.permute(0, 3, 1, 2)[m
+[32m+[m[41m            [m
+[32m+[m[32m        x = x.float() / 255.0[m
+[32m+[m[32m        x = self.cnn(x)[m
+[32m+[m[32m        x = self.fc(x)[m
+[32m+[m[32m        return x[m
+[32m+[m
+[32m+[m[32mclass HistoryEncoder(nn.Module):[m
+[32m+[m[32m    def __init__(self, obs_space):[m
+[32m+[m[32m        super().__init__()[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.image_conv = ImageEncoder(obs_space)[m
+[32m+[m[32m        self.image_embedding_size = self.image_conv.embedding_size[m
+[32m+[m[32m        self.semi_memory_size = 256[m
+[32m+[m[41m        [m
+[32m+[m[32m        # 3-Layer GRU Stack as in original model_vae.py[m
+[32m+[m[32m        self.memory_rnn1 = nn.GRUCell(self.image_embedding_size, self.semi_memory_size)[m
+[32m+[m[32m        self.memory_rnn2 = nn.GRUCell(self.semi_memory_size, self.semi_memory_size)[m
+[32m+[m[32m        self.memory_rnn3 = nn.GRUCell(self.semi_memory_size, self.semi_memory_size)[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.embedding_size = self.semi_memory_size[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Predictor (Context Generator)[m
+[32m+[m[32m        # In original code, prediction is used as context for VAE[m
+[32m+[m[32m        self.predictor = nn.Sequential([m
+[32m+[m[32m            nn.Linear(self.embedding_size + self.image_embedding_size, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, self.embedding_size)[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    @property[m
+[32m+[m[32m    def memory_size(self):[m
+[32m+[m[32m        # 3 * semi_memory_size because we have 3 stacked GRUs[m
+[32m+[m[32m        return 3 * self.semi_memory_size[m
+[32m+[m
+[32m+[m[32m    def forward(self, obs, memory):[m
+[32m+[m[32m        x = self.image_conv(obs)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Split memory into 3 parts[m
+[32m+[m[32m        memory1 = memory[:, :self.semi_memory_size][m
+[32m+[m[32m        memory2 = memory[:, self.semi_memory_size : 2*self.semi_memory_size][m
+[32m+[m[32m        memory3 = memory[:, 2*self.semi_memory_size : 3*self.semi_memory_size][m
+[32m+[m
+[32m+[m[32m        # Stacked GRU forward pass[m
+[32m+[m[32m        memory1 = self.memory_rnn1(x, memory1)[m
+[32m+[m[32m        memory2 = self.memory_rnn2(F.relu(memory1), memory2)[m
+[32m+[m[32m        memory3 = self.memory_rnn3(F.relu(memory2), memory3)[m
+[32m+[m
+[32m+[m[32m        # Concatenate memory back[m
+[32m+[m[32m        next_memory = torch.cat([memory1, memory2, memory3], dim=1)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Generate context (prediction) from (memory1 + memory2) and current obs embedding x[m
+[32m+[m[32m        # This matches original code logic: self.predictor(torch.cat((memory1 + memory2, x), dim=-1))[m
+[32m+[m[32m        # Note: Original code uses memory1 + memory2 (element-wise sum) not concatenation?[m
+[32m+[m[32m        # "torch.cat((memory1 + memory2, x), dim=-1)" implies element-wise sum of m1+m2 then concat with x.[m
+[32m+[m[32m        prediction = self.predictor(torch.cat((memory1 + memory2, x), dim=-1))[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Return context (h_t) and full memory state[m
+[32m+[m[32m        return prediction, next_memory[m
+[32m+[m
+[32m+[m[32mclass BeliefVAEModel(nn.Module):[m
+[32m+[m[32m    def __init__(self, obs_space, state_dim, latent_dim=32):[m
+[32m+[m[32m        super().__init__()[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.state_dim = state_dim[m
+[32m+[m[32m        self.phi_dim = state_dim  # Alias for clarity: VAE state input dim[m
+[32m+[m[32m        self.latent_dim = latent_dim[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.history_model = HistoryEncoder(obs_space)[m
+[32m+[m[32m        self.context_dim = self.history_model.semi_memory_size[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Encoder: q(z | s, h)[m
+[32m+[m[32m        self.vae_encoder = nn.Sequential([m
+[32m+[m[32m            nn.Linear(state_dim + self.context_dim, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, 2 * latent_dim) # mean, softplus(std)[m
+[32m+[m[32m        )[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Decoder: p(s | z, h)[m
+[32m+[m[32m        self.vae_decoder = nn.Sequential([m
+[32m+[m[32m            nn.Linear(latent_dim + self.context_dim, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, 2 * state_dim) # mean, softplus(std)[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m        # Learned conditional prior p(z | h)[m
+[32m+[m[32m        self.prior_net = nn.Sequential([m
+[32m+[m[32m            nn.Linear(self.context_dim, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, 2 * latent_dim)  # mean, softplus(std)[m
+[32m+[m[32m        )[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.apply(init_params)[m
+[32m+[m[32m        self.to(device)[m
+[32m+[m
+[32m+[m[32m    @property[m
+[32m+[m[32m    def memory_size(self):[m
+[32m+[m[32m        return self.history_model.memory_size[m
+[32m+[m
+[32m+[m[32m    def forward(self, obs, memory):[m
+[32m+[m[32m        # Standard interface for history update[m
+[32m+[m[32m        return self.history_model(obs, memory)[m
+[32m+[m
+[32m+[m[32m    def encoder_dist(self, state, context):[m
+[32m+[m[32m        x = torch.cat([state, context], dim=1)[m
+[32m+[m[32m        out = self.vae_encoder(x)[m
+[32m+[m[32m        mean = out[:, :self.latent_dim][m
+[32m+[m[32m        # Original style: softplus + offset[m
+[32m+[m[32m        std = F.softplus(out[:, self.latent_dim:], beta=1) + 0.1[m
+[32m+[m[32m        return mean, std[m
+[32m+[m
+[32m+[m[32m    def decoder_dist(self, z, context):[m
+[32m+[m[32m        x = torch.cat([z, context], dim=1)[m
+[32m+[m[32m        out = self.vae_decoder(x)[m
+[32m+[m[32m        mean = out[:, :self.state_dim][m
+[32m+[m[32m        # Original style[m
+[32m+[m[32m        std = F.softplus(out[:, self.state_dim:], beta=1) + 0.1[m
+[32m+[m[32m        return mean, std[m
+[32m+[m
+[32m+[m[32m    def prior_dist(self, context):[m
+[32m+[m[32m        """Learned conditional prior p(z | h)."""[m
+[32m+[m[32m        out = self.prior_net(context)[m
+[32m+[m[32m        mean = out[:, :self.latent_dim][m
+[32m+[m[32m        std = F.softplus(out[:, self.latent_dim:], beta=1) + 0.1[m
+[32m+[m[32m        return mean, std[m
+[32m+[m
+[32m+[m[32m    def sample_from_prior(self, context, num_samples: int = 1):[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Sample phi from learned prior p(z|h) then decode p(s|z,h).[m
+[32m+[m[32m        Returns: (B, num_samples, state_dim)[m
+[32m+[m[32m        """[m
+[32m+[m[32m        B = context.shape[0][m
+[32m+[m[32m        prior_mean, prior_std = self.prior_dist(context)[m
+[32m+[m[32m        z = prior_mean[:, None, :] + torch.randn([m
+[32m+[m[32m            B, num_samples, self.latent_dim, device=context.device[m
+[32m+[m[32m        ) * prior_std[:, None, :][m
+[32m+[m
+[32m+[m[32m        ctx = context[:, None, :].expand(-1, num_samples, -1)[m
+[32m+[m[32m        dec_mean, dec_std = self.decoder_dist([m
+[32m+[m[32m            z.reshape(B * num_samples, -1),[m
+[32m+[m[32m            ctx.reshape(B * num_samples, -1),[m
+[32m+[m[32m        )[m
+[32m+[m[32m        phi = Normal(dec_mean, dec_std).sample()[m
+[32m+[m[32m        return phi.view(B, num_samples, self.state_dim)[m
+[32m+[m
+[32m+[m[32m    def sample(self, context):[m
+[32m+[m[32m        # Sample from learned conditional prior p(z|h)[m
+[32m+[m[32m        return self.sample_from_prior(context, num_samples=1)[:, 0][m
+[1mdiff --git a/model_f_mikasa.py b/model_f_mikasa.py[m
+[1mnew file mode 100644[m
+[1mindex 0000000..b54e947[m
+[1m--- /dev/null[m
+[1m+++ b/model_f_mikasa.py[m
+[36m@@ -0,0 +1,245 @@[m
+[32m+[m[32m"""[m
+[32m+[m[32mMikasa-specific Representation Model for Sphinx/Believer.[m
+[32m+[m
+[32m+[m[32mThis model is designed for Mikasa environments where:[m
+[32m+[m[32m- obs (o_t): RGB image (H, W, C) - partial observation[m
+[32m+[m[32m- state (s_t): State vector (D,) - full ground-truth state[m
+[32m+[m
+[32m+[m[32mFollowing Believer paper:[m
+[32m+[m[32m- phi(s_t): State encoder (MLP) - captures task-relevant but unobservable information[m
+[32m+[m[32m- psi(o_t): Observation encoder (CNN) - captures observable information[m
+[32m+[m[32m- g(phi(s), psi(o), a): Dynamics model - predicts next state/obs encodings and reward[m
+[32m+[m[32m"""[m
+[32m+[m
+[32m+[m[32mimport torch[m
+[32m+[m[32mimport torch.nn as nn[m
+[32m+[m[32mimport torch.nn.functional as F[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef init_params(m):[m
+[32m+[m[32m    """Initialize parameters for linear layers."""[m
+[32m+[m[32m    classname = m.__class__.__name__[m
+[32m+[m[32m    if classname.find("Linear") != -1:[m
+[32m+[m[32m        m.weight.data.normal_(0, 1)[m
+[32m+[m[32m        m.weight.data *= 1 / torch.sqrt(m.weight.data.pow(2).sum(1, keepdim=True))[m
+[32m+[m[32m        if m.bias is not None:[m
+[32m+[m[32m            m.bias.data.fill_(0)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mclass RepresentationModelMikasa(nn.Module):[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Representation learning model for Mikasa environments.[m
+[32m+[m[41m    [m
+[32m+[m[32m    Args:[m
+[32m+[m[32m        obs_shape: Shape of RGB observation (H, W, C), e.g., (128, 128, 3)[m
+[32m+[m[32m        state_dim: Dimension of state vector[m
+[32m+[m[32m        action_dim: Dimension of action space[m
+[32m+[m[32m        latent_dim: Dimension of latent representation (default: 16)[m
+[32m+[m[32m        obs_embedding_size: Size of observation embedding after CNN (default: 256)[m
+[32m+[m[32m    """[m
+[32m+[m
+[32m+[m[32m    def __init__(self, obs_shape, state_dim, action_dim, latent_dim=16, obs_embedding_size=256):[m
+[32m+[m[32m        super().__init__()[m
+[32m+[m
+[32m+[m[32m        self.latent_dim = latent_dim[m
+[32m+[m[32m        self.obs_shape = obs_shape  # (H, W, C)[m
+[32m+[m[32m        self.state_dim = state_dim[m
+[32m+[m[32m        self.action_dim = action_dim[m
+[32m+[m[32m        self.obs_embedding_size = obs_embedding_size[m
+[32m+[m[41m        [m
+[32m+[m[32m        print(f"RepresentationModelMikasa initialized:")[m
+[32m+[m[32m        print(f"  obs_shape: {obs_shape}")[m
+[32m+[m[32m        print(f"  state_dim: {state_dim}")[m
+[32m+[m[32m        print(f"  action_dim: {action_dim}")[m
+[32m+[m[32m        print(f"  latent_dim: {latent_dim}")[m
+[32m+[m
+[32m+[m[32m        # =====================================================================[m
+[32m+[m[32m        # Observation Encoder: CNN for RGB images[m
+[32m+[m[32m        # Input: (B, H, W, C) -> permute to (B, C, H, W)[m
+[32m+[m[32m        # =====================================================================[m
+[32m+[m[32m        in_channels = obs_shape[2]  # C[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.obs_cnn = nn.Sequential([m
+[32m+[m[32m            nn.Conv2d(in_channels=in_channels, out_channels=32, kernel_size=8, stride=4, padding=0),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=0),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Flatten(),[m
+[32m+[m[32m        )[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Compute CNN output size[m
+[32m+[m[32m        with torch.no_grad():[m
+[32m+[m[32m            dummy_input = torch.zeros(1, in_channels, obs_shape[0], obs_shape[1])[m
+[32m+[m[32m            cnn_output_size = self.obs_cnn(dummy_input).shape[1][m
+[32m+[m[32m        print(f"  CNN output size: {cnn_output_size}")[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.obs_fc = nn.Sequential([m
+[32m+[m[32m            nn.Linear(cnn_output_size, obs_embedding_size),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m        )[m
+[32m+[m[41m        [m
+[32m+[m[32m        # psi(o): Observation encoder - outputs mean and std for latent distribution[m
+[32m+[m[32m        self.obs_encoder = nn.Sequential([m
+[32m+[m[32m            nn.Linear(obs_embedding_size, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, 2 * latent_dim)  # mean and log_std[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m        # =====================================================================[m
+[32m+[m[32m        # State Encoder: MLP for state vectors[m
+[32m+[m[32m        # Input: (B, state_dim)[m
+[32m+[m[32m        # =====================================================================[m
+[32m+[m[32m        # phi(s): State encoder - outputs mean and std for latent distribution[m
+[32m+[m[32m        self.state_encoder = nn.Sequential([m
+[32m+[m[32m            nn.Linear(state_dim, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, 2 * latent_dim)  # mean and log_std[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m        # =====================================================================[m
+[32m+[m[32m        # Dynamics Model: g(z_s, z_o, a) -> (z_s', z_o', r)[m
+[32m+[m[32m        # Input: concatenation of state latent, obs latent, and action[m
+[32m+[m[32m        # =====================================================================[m
+[32m+[m[32m        dynamics_input_dim = 2 * latent_dim + action_dim[m
+[32m+[m[41m        [m
+[32m+[m[32m        self.dynamics_model = nn.Sequential([m
+[32m+[m[32m            nn.Linear(dynamics_input_dim, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, 256),[m
+[32m+[m[32m            nn.ReLU(),[m
+[32m+[m[32m            nn.Linear(256, 256)[m
+[32m+[m[32m        )[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Prediction heads[m
+[32m+[m[32m        self.next_state_model = nn.Linear(256, latent_dim)[m
+[32m+[m[32m        self.next_obs_model = nn.Linear(256, latent_dim)[m
+[32m+[m[32m        self.reward_model = nn.Linear(256, 1)[m
+[32m+[m
+[32m+[m[32m        # Initialize parameters[m
+[32m+[m[32m        self.apply(init_params)[m
+[32m+[m
+[32m+[m[32m    def encode_obs(self, obs):[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Encode observation (RGB image) to latent distribution parameters.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Args:[m
+[32m+[m[32m            obs: RGB image tensor of shape (B, H, W, C) with values in [0, 255] or [0, 1][m
+[32m+[m[41m            [m
+[32m+[m[32m        Returns:[m
+[32m+[m[32m            encoder_mean: (B, latent_dim)[m
+[32m+[m[32m            encoder_std: (B, latent_dim)[m
+[32m+[m[32m        """[m
+[32m+[m[32m        # Permute from (B, H, W, C) to (B, C, H, W)[m
+[32m+[m[32m        x = obs.float()[m
+[32m+[m[32m        if x.max() > 1.0:[m
+[32m+[m[32m            x = x / 255.0  # Normalize to [0, 1][m
+[32m+[m[32m        x = x.permute(0, 3, 1, 2)  # (B, C, H, W)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # CNN + FC[m
+[32m+[m[32m        x = self.obs_cnn(x)[m
+[32m+[m[32m        x = self.obs_fc(x)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Encode to latent distribution[m
+[32m+[m[32m        output = self.obs_encoder(x)[m
+[32m+[m[32m        encoder_mean = output[:, :self.latent_dim][m
+[32m+[m[32m        encoder_std = F.softplus(output[:, self.latent_dim:], threshold=1) + 1e-5[m
+[32m+[m[41m        [m
+[32m+[m[32m        return encoder_mean, encoder_std[m
+[32m+[m
+[32m+[m[32m    def encode_state(self, state):[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Encode state vector to latent distribution parameters.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Args:[m
+[32m+[m[32m            state: State tensor of shape (B, state_dim)[m
+[32m+[m[41m            [m
+[32m+[m[32m        Returns:[m
+[32m+[m[32m            encoder_mean: (B, latent_dim)[m
+[32m+[m[32m            encoder_std: (B, latent_dim)[m
+[32m+[m[32m        """[m
+[32m+[m[32m        x = state.float()[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Encode to latent distribution[m
+[32m+[m[32m        output = self.state_encoder(x)[m
+[32m+[m[32m        encoder_mean = output[:, :self.latent_dim][m
+[32m+[m[32m        encoder_std = F.softplus(output[:, self.latent_dim:], threshold=1) + 1e-5[m
+[32m+[m[41m        [m
+[32m+[m[32m        return encoder_mean, encoder_std[m
+[32m+[m
+[32m+[m[32m    def predict_next(self, state, obs, action):[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Predict next state/obs latents and reward using dynamics model.[m
+[32m+[m[41m        [m
+[32m+[m[32m        Args:[m
+[32m+[m[32m            state: State tensor of shape (B, state_dim)[m
+[32m+[m[32m            obs: Observation tensor of shape (B, H, W, C)[m
+[32m+[m[32m            action: Action tensor of shape (B, action_dim) or (B,)[m
+[32m+[m[41m            [m
+[32m+[m[32m        Returns:[m
+[32m+[m[32m            next_state_pred: Predicted next state latent (B, latent_dim)[m
+[32m+[m[32m            next_obs_pred: Predicted next obs latent (B, latent_dim)[m
+[32m+[m[32m            reward_pred: Predicted reward (B, 1)[m
+[32m+[m[32m        """[m
+[32m+[m[32m        # Encode state and observation[m
+[32m+[m[32m        encoder_mean_s, encoder_std_s = self.encode_state(state)[m
+[32m+[m[32m        zs = encoder_me

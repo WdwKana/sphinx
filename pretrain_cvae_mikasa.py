@@ -117,9 +117,8 @@ if __name__ == "__main__":
     txt_logger.info("{}\n".format(" ".join(sys.argv)))
     txt_logger.info("{}\n".format(args))
 
-    # Set seed
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # Set seed for all randomness sources (python/numpy/torch/cuda)
+    rl_utils.seed(args.seed)
 
     txt_logger.info(f"Device: {device}\n")
 
