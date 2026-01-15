@@ -118,18 +118,21 @@ class Algo():
                 prior_mean, prior_std = self.belief_vae.prior_dist(history_encoding)
                 p = Normal(prior_mean, prior_std)
                 
-                # Sample z ~ q(z|s,h)
-                zs = encoder_mean + torch.randn_like(encoder_mean) * encoder_std
+                # Sample teacher z ~ q(z|s,h) for recon/distill
+                z_teacher = q.rsample()
+                
+                # Sample student z ~ p(z|h) for action (deployment-matched)
+                z_prior = p.rsample()
                 
                 # 3. VAE Decoder p(s | z, h)
-                decoder_mean, decoder_std = self.belief_vae.decoder_dist(zs, history_encoding)
+                decoder_mean, decoder_std = self.belief_vae.decoder_dist(z_teacher, history_encoding)
                 
                 # 4. Calculate ELBO (Monte Carlo Estimate)
                 log_px_z = Normal(decoder_mean, decoder_std).log_prob(state_features).sum(dim=-1)
                 kl = KL.kl_divergence(q, p).sum(dim=-1)
                 
                 # Optional action term via flow-matching: predict velocity for noisy action xt
-                action_term = 0.0
+                action_term = torch.zeros_like(log_px_z)
                 if hasattr(sb, "action"):
                     if self.action_flow_head is None:
                         self.action_dim = sb.action.shape[-1]
@@ -145,7 +148,7 @@ class Algo():
                     xt = t_noise * action + (1 - t_noise) * eps
                     v_target = action - eps  # flow matching target
                     
-                    act_in = torch.cat([xt, t_noise, history_encoding, zs], dim=1)
+                    act_in = torch.cat([xt, t_noise, history_encoding, z_prior], dim=1)
                     
                     v_hat = self.action_flow_head(act_in)
                     action_term = F.mse_loss(v_hat, v_target, reduction="none").sum(dim=-1)
@@ -158,7 +161,7 @@ class Algo():
                 mask = sb.mask.to(self.device)
                 recon_term = -log_px_z
                 kl_term = kl
-                action_term_to_log = action_term if torch.is_tensor(action_term) else torch.zeros_like(log_px_z)
+                action_term_to_log = action_term
 
                 batch_elbo_loss += -(elbo * mask).sum()
                 batch_kl        += (kl_term * mask).sum().detach()

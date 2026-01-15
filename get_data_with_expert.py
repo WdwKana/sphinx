@@ -354,7 +354,8 @@ def collect_random_data_sphinx_format(
     all_rewards = all_rewards[:num_episodes]
     all_masks = all_masks[:num_episodes]
     
-    save_dir = os.path.join(path_to_save_data, "sphinx_format")
+    #save_dir = os.path.join(path_to_save_data, "sphinx_format")
+    save_dir = path_to_save_data
     os.makedirs(save_dir, exist_ok=True)
     
     suffix = (output_suffix or "").strip()
