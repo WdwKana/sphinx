@@ -221,13 +221,40 @@ if __name__ == "__main__":
     if args.state_sentinel_replace is not None:
         sentinel = float(args.state_sentinel)
         replace = float(args.state_sentinel_replace)
-        n_before = int((states == sentinel).sum().item())
-        if n_before > 0:
-            txt_logger.info(
-                f"[state_preprocess] replacing state sentinel {sentinel} -> {replace} "
-                f"(count={n_before})"
+        shell_game_envs = {"ShellGameTouch-v0", "ShellGamePush-v0", "ShellGamePick-v0"}
+        if args.env in shell_game_envs:
+            outlier_mask = states >= sentinel
+            n_before = int(outlier_mask.sum().item())
+            if n_before > 0:
+                txt_logger.info(
+                    f"[state_preprocess] shifting state sentinel >= {sentinel} by -990 "
+                    f"(count={n_before})"
+                )
+            states = torch.where(outlier_mask, states - 990.0, states)
+            # Original replacement logic (kept for reference):
+            # n_before = int((states == sentinel).sum().item())
+            # if n_before > 0:
+            #     txt_logger.info(
+            #         f"[state_preprocess] replacing state sentinel {sentinel} -> {replace} "
+            #         f"(count={n_before})"
+            #     )
+            # states = torch.where(
+            #     states == sentinel,
+            #     torch.tensor(replace, device=states.device, dtype=states.dtype),
+            #     states,
+            # )
+        else:
+            n_before = int((states == sentinel).sum().item())
+            if n_before > 0:
+                txt_logger.info(
+                    f"[state_preprocess] replacing state sentinel {sentinel} -> {replace} "
+                    f"(count={n_before})"
+                )
+            states = torch.where(
+                states == sentinel,
+                torch.tensor(replace, device=states.device, dtype=states.dtype),
+                states,
             )
-        states = torch.where(states == sentinel, torch.tensor(replace, device=states.device, dtype=states.dtype), states)
     
     # Init Model
     vae_model = BeliefVAEModel(

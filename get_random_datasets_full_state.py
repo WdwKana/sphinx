@@ -155,6 +155,7 @@ def env_info(env_id):
 def collect_random_data_sphinx_format(
     env_id: str = "ShellGameTouch-v0", 
     path_to_save_data: str = "data",
+    save_subdir: str = "",
     num_episodes: int = 1000,
     batch_size: int = 128,
     seed: int = 42
@@ -320,9 +321,17 @@ def collect_random_data_sphinx_format(
     all_rewards = all_rewards[:num_episodes]
     all_masks = all_masks[:num_episodes]
     
-    save_dir = os.path.join(path_to_save_data, "sphinx_format")
+    # =========================================================================
+    # Save
+    # =========================================================================
+    # Historically, many pipelines expect datasets at:
+    #   {path_to_save_data}/collect_{env_id}.pt
+    # This script used to always place them under a "sphinx_format/" subdir.
+    # We now make that subdir optional.
+    os.makedirs(path_to_save_data, exist_ok=True)
+    save_dir = os.path.join(path_to_save_data, save_subdir) if save_subdir else path_to_save_data
     os.makedirs(save_dir, exist_ok=True)
-    
+
     save_path = os.path.join(save_dir, f"collect_{env_id}.pt")
     
     data_dict = {
@@ -357,6 +366,8 @@ class Args:
     """Environment ID to collect data from"""
     path_to_save_data: str = "data"
     """Directory to save collected data"""
+    save_subdir: str = ""
+    """Optional subdirectory under path_to_save_data (e.g., 'sphinx_format'). Empty means save directly in path_to_save_data."""
     num_episodes: int = 1000
     """Number of episodes to collect"""
     batch_size: int = 128
@@ -381,6 +392,7 @@ if __name__ == "__main__":
     collect_random_data_sphinx_format(
         env_id=args.env_id,
         path_to_save_data=args.path_to_save_data,
+        save_subdir=args.save_subdir,
         num_episodes=args.num_episodes,
         batch_size=args.batch_size,
         seed=args.seed

@@ -218,19 +218,59 @@ if __name__ == "__main__":
     if args.state_sentinel_replace is not None:
         sentinel = float(args.state_sentinel)
         replace = float(args.state_sentinel_replace)
-        # Count before (for logging)
-        n_s = int((exps["state"] == sentinel).sum().item())
-        n_ns = int((exps["next_state"] == sentinel).sum().item())
-        total = n_s + n_ns
-        if total > 0:
-            print(
-                f"[state_preprocess] replacing state sentinel {sentinel} -> {replace} "
-                f"(state: {n_s}, next_state: {n_ns}, total: {total})"
+        shell_game_envs = {"ShellGameTouch-v0", "ShellGamePush-v0", "ShellGamePick-v0"}
+        if args.env in shell_game_envs:
+            mask_state = exps["state"] >= sentinel
+            mask_next_state = exps["next_state"] >= sentinel
+            n_s = int(mask_state.sum().item())
+            n_ns = int(mask_next_state.sum().item())
+            total = n_s + n_ns
+            if total > 0:
+                print(
+                    f"[state_preprocess] shifting state sentinel >= {sentinel} by -990 "
+                    f"(state: {n_s}, next_state: {n_ns}, total: {total})"
+                )
+            exps["state"] = torch.where(mask_state, exps["state"] - 990.0, exps["state"])
+            exps["next_state"] = torch.where(mask_next_state, exps["next_state"] - 990.0, exps["next_state"])
+            # Original replacement logic (kept for reference):
+            # n_s = int((exps["state"] == sentinel).sum().item())
+            # n_ns = int((exps["next_state"] == sentinel).sum().item())
+            # total = n_s + n_ns
+            # if total > 0:
+            #     print(
+            #         f"[state_preprocess] replacing state sentinel {sentinel} -> {replace} "
+            #         f"(state: {n_s}, next_state: {n_ns}, total: {total})"
+            #     )
+            # exps["state"] = torch.where(
+            #     exps["state"] == sentinel,
+            #     torch.tensor(replace, dtype=exps["state"].dtype),
+            #     exps["state"],
+            # )
+            # exps["next_state"] = torch.where(
+            #     exps["next_state"] == sentinel,
+            #     torch.tensor(replace, dtype=exps["next_state"].dtype),
+            #     exps["next_state"],
+            # )
+        else:
+            # Count before (for logging)
+            n_s = int((exps["state"] == sentinel).sum().item())
+            n_ns = int((exps["next_state"] == sentinel).sum().item())
+            total = n_s + n_ns
+            if total > 0:
+                print(
+                    f"[state_preprocess] replacing state sentinel {sentinel} -> {replace} "
+                    f"(state: {n_s}, next_state: {n_ns}, total: {total})"
+                )
+            exps["state"] = torch.where(
+                exps["state"] == sentinel,
+                torch.tensor(replace, dtype=exps["state"].dtype),
+                exps["state"],
             )
-        exps["state"] = torch.where(exps["state"] == sentinel, torch.tensor(replace, dtype=exps["state"].dtype), exps["state"])
-        exps["next_state"] = torch.where(
-            exps["next_state"] == sentinel, torch.tensor(replace, dtype=exps["next_state"].dtype), exps["next_state"]
-        )
+            exps["next_state"] = torch.where(
+                exps["next_state"] == sentinel,
+                torch.tensor(replace, dtype=exps["next_state"].dtype),
+                exps["next_state"],
+            )
     
     # Free original data to save memory
     del data
