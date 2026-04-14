@@ -2,6 +2,16 @@ __pycache__/
 *.pyc
 *.pyo
 *.pt
+
+# Training data, models, and logs
 slurm_logs/
 storage/
+storage_cvae/
 data/
+
+# SLURM reference-script run logs (keep the .sh/.slurm scripts, not the logs)
+slurm_script/*.err
+slurm_script/*.out
+
+# Local editor/agent settings
+.claude/

@@ -155,8 +155,15 @@ if __name__ == "__main__":
     txt_logger.info("RepModel loaded\n")
     txt_logger.info("{}\n".format(rep_model))
 
-    model_name = str(args.env) + "_representation_learning_seed" + str(args.seed)  # args.rep_model_dir
+    # Keep the offline representation pretraining fixed to seed 1 so RL runs
+    # can vary only the policy/training seed during comparison experiments.
+    rep_pretrain_seed = 1
+    model_name = str(args.env) + "_representation_learning_seed" + str(rep_pretrain_seed)
+    # Original behavior: require the representation pretraining seed to match
+    # the current RL seed exactly.
+    # model_name = str(args.env) + "_representation_learning_seed" + str(args.seed)  # args.rep_model_dir
     rep_model_dir = rl_utils.get_model_dir(model_name)
+    txt_logger.info(f"Loading representation pretrain from seed {rep_pretrain_seed}: {rep_model_dir}\n")
     rep_model_checkpoint = rl_utils.get_status(rep_model_dir)
     rep_model.load_state_dict(rep_model_checkpoint["model_state"])
 

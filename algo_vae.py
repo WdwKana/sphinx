@@ -55,7 +55,13 @@ class Algo(BaseAlgo):
                                         latent_dim=latent_dim, predict_full_state=predict_full_state, use_cnn=use_cnn).to(device)
 
         assert(seed != -1)
-        path = "storage/" + str(env_name) +  "_belief_vae_seed" + str(seed)
+        # Keep the belief pretraining fixed to seed 1 so downstream RL runs
+        # only differ by the RL seed during evaluation/comparison.
+        belief_pretrain_seed = 1
+        path = "storage/" + str(env_name) +  "_belief_vae_seed" + str(belief_pretrain_seed)
+        # Original behavior: require the belief pretraining seed to match the
+        # current RL seed exactly.
+        # path = "storage/" + str(env_name) +  "_belief_vae_seed" + str(seed)
         status = rl_utils.get_status(path)
         print("Loading model " + path)
         self.belief_vae.load_state_dict(status["vae_model_state"])

@@ -3,7 +3,12 @@ import gym_minigrid
 import escape_room
 
 def make_env(env_key, seed=None):
-    env = gym.make(env_key)
+    # These legacy environments predate Gym's stricter checker and may
+    # return extra observation keys like "mission" or "direction".
+    try:
+        env = gym.make(env_key, disable_env_checker=True)
+    except TypeError:
+        env = gym.make(env_key)
     env.seed(seed)
     return env
 
